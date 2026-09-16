@@ -40,6 +40,17 @@ class Settings(BaseSettings):
     # Extra category is excluded from website sync by explicit business rule.
     excluded_sync_category_names: tuple[str, ...] = ("Extra",)
 
+    # CORS allowlist for browser-based clients (Electron renderer via Vite
+    # dev server, and later any web-based back-office). Dev default covers
+    # the standard Vite ports on localhost/127.0.0.1; production must
+    # override with the real allowlist via IGPOS_CORS_ORIGINS.
+    cors_origins: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ]
+
     @field_validator("jwt_secret")
     @classmethod
     def _no_insecure_secret_in_production(cls, v: str, info):
