@@ -1,0 +1,56 @@
+# CI runs entirely on GitHub-hosted runners with a free Postgres service
+# container — no paid CI/CD add-ons required (plan §97).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  api-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: igpos
+          POSTGRES_PASSWORD: igpos_dev_local
+          POSTGRES_DB: igpos_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: services/api
+        run: pip install -r requirements.txt
+      - name: Run tests
+        working-directory: services/api
+        env:
+          IGPOS_DATABASE_URL: postgresql+psycopg://igpos:igpos_dev_local@localhost:5432/igpos_test
+          PYTHONPATH: ".:../..:../../integrations"
+        run: python -m pytest tests/ -v
+
+  desktop-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        working-directory: apps/pos/desktop
+        run: npm ci
+      - name: Typecheck renderer
+        working-directory: apps/pos/desktop
+        run: npx tsc -b --noEmit
+      - name: Typecheck electron main
+        working-directory: apps/pos/desktop
+        run: npx tsc -p electron/tsconfig.json --noEmit

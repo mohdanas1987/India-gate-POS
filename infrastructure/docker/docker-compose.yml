@@ -1,0 +1,35 @@
+# Local development only — zero paid services (plan §5). Postgres + Redis
+# run entirely on the developer's machine; nothing here requires an
+# account, a subscription, or external network access.
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: igpos
+      POSTGRES_PASSWORD: igpos_dev_local
+      POSTGRES_DB: igpos_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - igpos_pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: ../../services/api
+    environment:
+      IGPOS_DATABASE_URL: postgresql+psycopg://igpos:igpos_dev_local@postgres:5432/igpos_dev
+      IGPOS_ENV: development
+    ports:
+      - "8100:8100"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  igpos_pg_data:

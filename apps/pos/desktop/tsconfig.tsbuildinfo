@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/global.d.ts","./src/main.tsx","./src/vite-env.d.ts","./src/components/ConnectivityBadge.tsx","./src/pages/PosPage.tsx","./src/pages/WebsiteOrdersPage.tsx","./src/store/connectivity.ts","./src/sync/outboxSync.ts","./src/sync/schema.ts"],"version":"5.9.3"}
