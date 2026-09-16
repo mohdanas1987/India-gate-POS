@@ -9,7 +9,8 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --noEmit",
     "electron:build": "tsc -p electron/tsconfig.json",
-    "lint": "eslint . --ext .ts,.tsx"
+    "lint": "eslint . --ext .ts,.tsx",
+    "smoke-test": "node smoke-test.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.62.0",
@@ -30,6 +31,7 @@
     "autoprefixer": "^10.4.20",
     "bwip-js": "^4.11.4",
     "electron": "^34.0.1",
+    "playwright": "^1.63.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.2",

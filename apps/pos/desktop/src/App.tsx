@@ -1,11 +1,15 @@
-import { HashRouter, Routes, Route, Link } from "react-router-dom";
+import { HashRouter, Routes, Route, Link, Navigate } from "react-router-dom";
 import { PosPage } from "./pages/PosPage";
 import { WebsiteOrdersPage } from "./pages/WebsiteOrdersPage";
+import { LoginPage } from "./pages/LoginPage";
 
-// Dev-only placeholder token/apiBase wiring — real auth flow (login screen
-// calling POST /api/v1/auth/login and storing the token securely) is a
-// follow-up task, not yet built. Flagged in the phase status report.
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8100";
+
+function RequireAuth({ children }: { children: JSX.Element }) {
+  const token = localStorage.getItem("igpos_dev_token");
+  if (!token) return <Navigate to="/login" replace />;
+  return children;
+}
 
 export function App() {
   const token = localStorage.getItem("igpos_dev_token") ?? "";
@@ -17,10 +21,25 @@ export function App() {
         <Link to="/website-orders">Website Orders</Link>
       </nav>
       <Routes>
-        <Route path="/pos" element={<PosPage />} />
-        <Route path="/website-orders" element={<WebsiteOrdersPage apiBase={API_BASE} token={token} />} />
+        <Route path="/login" element={<LoginPage />} />
+        <Route
+          path="/pos"
+          element={
+            <RequireAuth>
+              <PosPage />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/website-orders"
+          element={
+            <RequireAuth>
+              <WebsiteOrdersPage apiBase={API_BASE} token={token} />
+            </RequireAuth>
+          }
+        />
         <Route path="/pos/customer" element={<div className="p-6 text-2xl">Customer display</div>} />
-        <Route path="*" element={<PosPage />} />
+        <Route path="*" element={<Navigate to="/pos" replace />} />
       </Routes>
     </HashRouter>
   );
