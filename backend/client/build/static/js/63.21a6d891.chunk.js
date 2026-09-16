@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkpos=self.webpackChunkpos||[]).push([[63],{4444:(e,s,r)=>{r.r(s),r.d(s,{default:()=>t});r(9950);var n=r(4414);function t(){return(0,n.jsx)(n.Fragment,{children:"Register"})}}}]);

@@ -1,0 +1,2 @@
+"use strict";(self.webpackChunkpos=self.webpackChunkpos||[]).push([[243],{3243:(e,s,r)=>{r.r(s),r.d(s,{default:()=>t});r(5043);var n=r(579);function t(){return(0,n.jsx)(n.Fragment,{children:"Register"})}}}]);
+//# sourceMappingURL=243.80ba96f4.chunk.js.map

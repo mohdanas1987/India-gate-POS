@@ -1,0 +1,8 @@
+node_modules/
+backend/node_modules/
+backend/database/
+backend/tmp/
+POS-v3/
+POS-v3.zip
+*.log
+.DS_Store
