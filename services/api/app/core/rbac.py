@@ -67,3 +67,20 @@ def require_permission(permission: str) -> Callable[..., Principal]:
         return principal
 
     return _dependency
+
+
+def principal_has_permission(db, principal: Principal, permission: str) -> bool:
+    """Same check as require_permission's dependency, exposed as a plain
+    function for routes that need a conditional/secondary permission check
+    inline (e.g. 'does this caller ALSO hold the override permission')
+    rather than a hard all-or-nothing route dependency."""
+    from app.domain.authz import Role, RolePermission, Permission
+
+    return (
+        db.query(RolePermission)
+        .join(Permission, Permission.id == RolePermission.permission_id)
+        .join(Role, Role.id == RolePermission.role_id)
+        .filter(Role.name == principal.role, Permission.code == permission)
+        .first()
+        is not None
+    )

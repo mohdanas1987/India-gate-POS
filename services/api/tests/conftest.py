@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.db.base import Base
-from app.db.session import engine, SessionLocal
+from app.db.session import engine
 import app.domain  # noqa: F401 populate metadata
 
 
@@ -20,9 +20,22 @@ def _create_schema():
 
 @pytest.fixture
 def db() -> Session:
-    session = SessionLocal()
+    """
+    Each test runs inside an outer transaction + savepoint. A `db.commit()`
+    inside the code under test (e.g. app/services/checkout.py genuinely
+    calls db.commit()) only commits the *savepoint*, not the outer
+    transaction — SQLAlchemy 2.0's join_transaction_mode="create_savepoint"
+    handles re-opening a fresh savepoint after each commit. The final
+    rollback undoes everything, so tests never leak data (or unique-
+    constraint collisions like duplicate seeded emails) into each other,
+    even though the code being tested calls real commit().
+    """
+    connection = engine.connect()
+    outer_transaction = connection.begin()
+    session = Session(bind=connection, join_transaction_mode="create_savepoint")
     try:
         yield session
     finally:
-        session.rollback()
         session.close()
+        outer_transaction.rollback()
+        connection.close()

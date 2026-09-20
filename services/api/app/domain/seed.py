@@ -9,11 +9,12 @@ from sqlalchemy.orm import Session
 
 from app.domain.authz import Permission, Role, RolePermission
 from app.domain.catalog import Category
-from app.domain.tenancy import Tenant, Store
+from app.domain.tenancy import Tenant, Store, Register
 
 DEFAULT_PERMISSIONS = [
     "orders.create",
     "orders.refund",
+    "orders.refund.override",
     "products.create",
     "products.update",
     "products.delete",
@@ -22,6 +23,7 @@ DEFAULT_PERMISSIONS = [
     "sync.manage",
     "reports.view",
     "admin.manage_users",
+    "cash.manage_session",
 ]
 
 # Role -> permission codes. Owner/Administrator get everything; others are
@@ -32,14 +34,16 @@ DEFAULT_ROLE_PERMISSIONS = {
     "Store Manager": [
         "orders.create",
         "orders.refund",
+        "orders.refund.override",
         "products.create",
         "products.update",
         "website_orders.view",
         "website_orders.change_status",
         "sync.manage",
         "reports.view",
+        "cash.manage_session",
     ],
-    "Cashier": ["orders.create", "website_orders.view"],
+    "Cashier": ["orders.create", "website_orders.view", "cash.manage_session"],
     "Inventory Manager": ["products.create", "products.update", "reports.view"],
     "Website Manager": ["website_orders.view", "website_orders.change_status", "sync.manage"],
 }
@@ -55,6 +59,11 @@ def seed_tenant_and_store(db: Session) -> tuple[Tenant, Store]:
     if not store:
         store = Store(tenant_id=tenant.id, name="India Gate — Main Store")
         db.add(store)
+        db.flush()
+    register = db.query(Register).filter(Register.store_id == store.id).first()
+    if not register:
+        register = Register(store_id=store.id, name="Register 1")
+        db.add(register)
         db.flush()
     return tenant, store
 
@@ -107,7 +116,8 @@ def seed_categories(db: Session) -> None:
     db.commit()
 
 
-def seed_all(db: Session) -> None:
-    seed_tenant_and_store(db)
+def seed_all(db: Session) -> Tenant:
+    tenant, _ = seed_tenant_and_store(db)
     seed_rbac(db)
     seed_categories(db)
+    return tenant
