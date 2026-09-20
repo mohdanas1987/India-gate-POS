@@ -2,10 +2,31 @@
  * Phase 8 — sync engine: drains outbox_events to the cloud API whenever
  * reachable, with exponential backoff (plan §43). The cashier flow never
  * calls this synchronously; it's a background loop.
+ *
+ * Phase 8.5 rework (CTO audit of 0cfd8ca, finding #18 — "the documentation
+ * says exponential backoff, but the current engine effectively retries
+ * every 5 seconds ... retry_count is incremented, but there is no actual
+ * 2s/4s/8s/16s delay calculation"): that was a real, correctly-identified
+ * gap. computeBackoffMs() below is the actual 2^n calculation with a cap
+ * and jitter, and every failed row now gets a real next_attempt_at instead
+ * of being retried on the very next fixed-interval tick regardless of how
+ * many times it has already failed.
  */
 import Database from "better-sqlite3";
 import { randomUUID } from "crypto";
 import { nextSequence } from "./schema";
+
+/**
+ * 2s, 4s, 8s, 16s, 32s, ... capped at 5 minutes, with +/-20% jitter so a
+ * batch of events that all failed on the same tick don't all retry on
+ * the exact same future tick and thunder-herd the API the moment
+ * connectivity returns.
+ */
+export function computeBackoffMs(retryCount: number, capMs = 5 * 60 * 1000): number {
+  const raw = Math.min(2000 * Math.pow(2, Math.max(0, retryCount - 1)), capMs);
+  const jitterFactor = 0.8 + Math.random() * 0.4; // 0.8x - 1.2x
+  return Math.round(raw * jitterFactor);
+}
 
 export type ConnectivityState = "ONLINE" | "OFFLINE" | "SYNCING" | "SYNC_ERROR" | "PARTIALLY_CONNECTED";
 
@@ -34,6 +55,7 @@ interface OutboxRow {
   event_type: string;
   payload: string;
   retry_count: number;
+  next_attempt_at: string;
 }
 
 export class OutboxSyncEngine {
@@ -62,8 +84,17 @@ export class OutboxSyncEngine {
   }
 
   private async tick(): Promise<void> {
+    // Finding #18 fix: only pick up rows whose next_attempt_at has
+    // actually arrived. A row that just failed and got a 32-second
+    // backoff must NOT be retried on the very next 5-second timer tick —
+    // that was the entire bug: retry_count went up, but nothing ever
+    // consulted it to decide WHEN to retry.
     const pending = this.db
-      .prepare(`SELECT * FROM outbox_events WHERE synced_at IS NULL ORDER BY sequence ASC LIMIT 25`)
+      .prepare(
+        `SELECT * FROM outbox_events
+         WHERE synced_at IS NULL AND next_attempt_at <= datetime('now')
+         ORDER BY sequence ASC LIMIT 25`
+      )
       .all() as OutboxRow[];
 
     if (pending.length === 0) {
@@ -102,10 +133,15 @@ export class OutboxSyncEngine {
         }
       } catch (err) {
         anyFailure = true;
-        const backoffRetry = row.retry_count + 1;
+        const newRetryCount = row.retry_count + 1;
+        const delayMs = computeBackoffMs(newRetryCount);
         this.db
-          .prepare(`UPDATE outbox_events SET retry_count = ?, last_error = ? WHERE event_id = ?`)
-          .run(backoffRetry, String(err), row.event_id);
+          .prepare(
+            `UPDATE outbox_events
+             SET retry_count = ?, last_error = ?, next_attempt_at = datetime('now', ?)
+             WHERE event_id = ?`
+          )
+          .run(newRetryCount, String(err), `+${Math.round(delayMs / 1000)} seconds`, row.event_id);
       }
     }
 

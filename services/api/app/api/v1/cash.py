@@ -11,6 +11,7 @@ from app.core.rbac import require_permission
 from app.core.security import Principal
 from app.db.session import get_db
 from app.domain.cash import CashierSession
+from app.services.authorization import AuthorizationError, resolve_authorized_register
 
 router = APIRouter(prefix="/cash", tags=["cash"])
 
@@ -47,6 +48,17 @@ def get_current_session(
     (PosPage.tsx) replace it with something a fresh checkout can actually
     discover and drive itself.
     """
+    # Register-ownership check (CTO audit of 0cfd8ca, finding #7): only
+    # enforced when this principal is scoped to a single store — a
+    # multi-store role (principal.store_id is None) is allowed to check
+    # any register's status within its own tenant, same as the existing
+    # tenant-only filter below.
+    if principal.store_id is not None:
+        try:
+            resolve_authorized_register(db, principal.tenant_id, principal.store_id, register_id)
+        except AuthorizationError as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
     session = (
         db.query(CashierSession)
         .filter(
@@ -66,6 +78,23 @@ def open_session(
     db: Session = Depends(get_db),
     principal: Principal = Depends(require_permission("cash.manage_session")),
 ):
+    if principal.store_id is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="This user has no store assigned — cannot open a cashier session without a store context",
+        )
+
+    # CTO audit of 0cfd8ca, finding #7 (the same architectural problem as
+    # checkout's finding #6): this used to filter only on
+    # CashierSession.register_id == body.register_id, trusting that "if
+    # the user says register_id=7, register 7 belongs to their store."
+    # It doesn't get to assume that — it has to prove it, via the same
+    # centralized resolver checkout.py uses.
+    try:
+        resolve_authorized_register(db, principal.tenant_id, principal.store_id, body.register_id)
+    except AuthorizationError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
     existing = (
         db.query(CashierSession)
         .filter(CashierSession.register_id == body.register_id, CashierSession.is_open.is_(True))
@@ -74,11 +103,6 @@ def open_session(
     if existing:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="A session is already open on this register")
 
-    if principal.store_id is None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="This user has no store assigned — cannot open a cashier session without a store context",
-        )
     session = CashierSession(
         tenant_id=principal.tenant_id,
         store_id=principal.store_id,

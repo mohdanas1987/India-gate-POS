@@ -34,6 +34,7 @@ from app.domain.cash import CashierSession
 from app.domain.catalog import Product, Tax
 from app.domain.inventory import InventoryLedger, LedgerEventType
 from app.domain.orders import Order, OrderLine, OrderPayment, OrderStatus, PaymentMethod, SalesChannel
+from app.services.authorization import AuthorizationError, resolve_authorized_register
 
 
 class CheckoutError(Exception):
@@ -46,6 +47,18 @@ class NoOpenSessionError(CheckoutError):
 
 class InvalidCartError(CheckoutError):
     pass
+
+
+class UnauthorizedResourceError(CheckoutError):
+    """
+    Phase 8.5 (CTO audit of 0cfd8ca, finding #6 — RELEASE BLOCKER):
+    create_pos_sale() used to trust register_id/product_id as belonging to
+    the caller's tenant/store just because the route's Principal check
+    passed. That is not sufficient — a Tenant A caller who guesses or
+    manipulates Tenant B's register_id or product_id must be refused HERE,
+    in the domain service, not merely at the route layer. This exception
+    is raised whenever that chain of ownership does not hold.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,10 +85,23 @@ def compute_line_total(product: Product, tax: Tax | None, quantity: int) -> tupl
     return line_subtotal.minor_units, line_tax.minor_units, (line_subtotal + line_tax).minor_units
 
 
-def get_open_session(db: Session, register_id: int) -> CashierSession:
+def get_open_session(db: Session, tenant_id: int, store_id: int, register_id: int) -> CashierSession:
+    # Defense in depth, even after resolve_authorized_register() has
+    # already proven register_id belongs to this tenant/store: also
+    # require the session ROW ITSELF to carry the same tenant_id/store_id,
+    # not just the same register_id. A session is a full three-part key
+    # (tenant, store, register), and matching on register_id alone was
+    # exactly the CTO's finding #6 — "essentially CashierSession.register_id
+    # == register_id ... rather than enforcing tenant_id, store_id,
+    # register_id together."
     session = (
         db.query(CashierSession)
-        .filter(CashierSession.register_id == register_id, CashierSession.is_open.is_(True))
+        .filter(
+            CashierSession.register_id == register_id,
+            CashierSession.tenant_id == tenant_id,
+            CashierSession.store_id == store_id,
+            CashierSession.is_open.is_(True),
+        )
         .order_by(CashierSession.id.desc())
         .first()
     )
@@ -96,10 +122,28 @@ def create_pos_sale(
     payment_method: PaymentMethod,
     currency: str = "EUR",
 ) -> Order:
+    """
+    NOTE on transaction ownership (CTO audit of 0cfd8ca, finding #17 —
+    "the service shouldn't independently commit"): this function no
+    longer calls db.commit() itself. It flushes so generated ids (order.id,
+    etc.) are available to build dependent rows within the same call, but
+    the CALLER (the route, or the sync endpoint) owns the transaction
+    boundary — it decides when to commit and is responsible for rolling
+    back on any exception this function raises. This lets a caller compose
+    this operation with other writes (an inbox event, an audit trail
+    entry outside this function's own AuditLog row, a website-order status
+    update) inside exactly one atomic transaction, instead of two services
+    each independently committing and stepping on each other.
+    """
     if not lines:
         raise InvalidCartError("Cart is empty")
 
-    session = get_open_session(db, register_id)
+    try:
+        resolve_authorized_register(db, tenant_id, store_id, register_id)
+    except AuthorizationError as exc:
+        raise UnauthorizedResourceError(str(exc)) from exc
+
+    session = get_open_session(db, tenant_id, store_id, register_id)
 
     order = Order(
         tenant_id=tenant_id,
@@ -117,7 +161,17 @@ def create_pos_sale(
     tax_minor = 0
 
     for line_input in lines:
-        product = db.get(Product, line_input.product_id)
+        # CTO audit of 0cfd8ca, finding #6 (RELEASE BLOCKER): this used to
+        # be db.get(Product, line_input.product_id) with NO tenant filter
+        # at all — a Tenant A cashier who knew or guessed a Tenant B
+        # product id could ring up a sale against another tenant's catalog
+        # entirely undetected. Every product must now prove it belongs to
+        # the same tenant transacting, not just exist somewhere in the DB.
+        product = (
+            db.query(Product)
+            .filter(Product.id == line_input.product_id, Product.tenant_id == tenant_id)
+            .first()
+        )
         if not product or product.is_deleted:
             raise InvalidCartError(f"Product {line_input.product_id} not found or deleted")
 
@@ -168,6 +222,7 @@ def create_pos_sale(
         )
     )
 
-    db.commit()
-    db.refresh(order)
+    # Flush, don't commit — see the transaction-ownership note on this
+    # function's docstring. The caller commits (or rolls back).
+    db.flush()
     return order

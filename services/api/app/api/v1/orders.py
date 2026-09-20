@@ -6,11 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.core.rbac import require_permission, principal_has_permission
+from app.core.rbac import require_permission
 from app.core.security import Principal
 from app.db.session import get_db
 from app.domain.orders import Order, PaymentMethod
-from app.services.checkout import CartLineInput, CheckoutError, create_pos_sale
+from app.services.checkout import CartLineInput, CheckoutError, UnauthorizedResourceError, create_pos_sale
 from app.services.refunds import RefundError, RefundRequiresApprovalError, process_refund
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -65,7 +65,16 @@ def create_order(
             lines=[CartLineInput(l.product_id, l.quantity) for l in body.lines],
             payment_method=body.payment_method,
         )
+        # Transaction ownership lives here now (CTO audit finding #17):
+        # create_pos_sale only flushes. This route is the single
+        # transaction boundary for a direct POS sale.
+        db.commit()
+        db.refresh(order)
+    except UnauthorizedResourceError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except CheckoutError as exc:
+        db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return order
 
@@ -97,34 +106,40 @@ def refund_order(
     db: Session = Depends(get_db),
     principal: Principal = Depends(require_permission("orders.refund")),
 ):
-    # The override flag bypasses the approval threshold entirely, so it
-    # requires its own, separately-granted permission — never just
-    # whatever the caller sends. A Cashier holding "orders.refund" cannot
-    # self-approve by setting manager_override=true; only a role that
-    # also has "orders.refund.override" (Owner/Administrator/Store
-    # Manager in the seed data) can.
-    effective_override = body.manager_override and principal_has_permission(db, principal, "orders.refund.override")
-
+    # process_refund itself now independently checks
+    # "orders.refund.override" against `principal` (CTO audit finding #14
+    # — a critical financial invariant should not depend entirely on the
+    # route remembering to gate it). This route just passes the caller's
+    # request through; it no longer pre-computes an "effective override"
+    # the service is expected to trust.
     try:
         refund = process_refund(
             db,
             tenant_id=principal.tenant_id,
             order_id=order_id,
-            requested_by_user_id=principal.user_id,
+            principal=principal,
             amount_minor=body.amount_minor,
             reason=body.reason,
-            is_manager_override=effective_override,
+            manager_override_requested=body.manager_override,
         )
+        db.commit()
+        db.refresh(refund)
     except RefundRequiresApprovalError as exc:
+        # A pending Approval row now actually exists (finding #13) — its
+        # id is returned so the UI/manager flow has something concrete to
+        # act on, not just an error message.
+        db.commit()  # persist the Approval row created before this was raised
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             detail={
                 "message": str(exc),
                 "action_code": exc.action_code,
                 "threshold_minor_units": exc.threshold_minor_units,
+                "approval_id": exc.approval_id,
             },
         ) from exc
     except RefundError as exc:
+        db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     return {"status": "ok", "refund_id": refund.id, "amount_minor": refund.amount_minor}

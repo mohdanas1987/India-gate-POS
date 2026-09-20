@@ -123,6 +123,40 @@ def test_a_bad_product_id_is_recorded_as_a_failure_not_a_silent_partial_order(db
     assert orphaned_orders == []
 
 
+def test_device_sequence_gap_is_recorded_as_a_conflict(db, synced_setup):
+    """CTO audit of 0cfd8ca, finding #19: a device that skips a sequence
+    number (event 1 delivered, event 2 lost, event 3 arrives next) must
+    have that gap recorded, not silently ignored."""
+    from app.domain.sync import Conflict, DeviceSyncState
+    from app.domain.tenancy import Device
+
+    first = _event(synced_setup["product_id"], synced_setup["register_id"])
+    first.sequence = 1
+    result1 = ingest_sync_event(first, db, synced_setup["principal"])
+    assert result1.status == "processed"
+
+    # Sequence 2 is skipped entirely — simulate event 3 arriving next.
+    third = _event(synced_setup["product_id"], synced_setup["register_id"])
+    third.sequence = 3
+    result3 = ingest_sync_event(third, db, synced_setup["principal"])
+    assert result3.status == "processed"
+
+    device = db.query(Device).filter(Device.fingerprint == f"unregistered-device-user-{synced_setup['principal'].user_id}").first()
+    state = db.get(DeviceSyncState, device.id)
+    assert state.last_sequence_received == 3
+    assert state.failed_count == 1
+
+    gap = (
+        db.query(Conflict)
+        .filter(Conflict.aggregate_type == "device_sequence", Conflict.aggregate_id == str(device.id))
+        .first()
+    )
+    assert gap is not None
+    assert gap.local_value == "2"  # the expected-next sequence that never arrived
+    assert gap.remote_value == "3"
+    assert gap.resolution == "PENDING"
+
+
 def test_unknown_event_type_is_rejected_not_silently_accepted(db, synced_setup):
     body = _event(synced_setup["product_id"], synced_setup["register_id"])
     body.event_type = "product.price_changed"  # not implemented server-side yet

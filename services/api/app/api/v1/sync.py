@@ -38,9 +38,9 @@ from app.core.rbac import require_permission
 from app.core.security import Principal
 from app.db.session import get_db
 from app.domain.orders import PaymentMethod
-from app.domain.sync import InboxEvent
+from app.domain.sync import Conflict, DeviceSyncState, InboxEvent
 from app.domain.tenancy import Device
-from app.services.checkout import CartLineInput, CheckoutError, create_pos_sale
+from app.services.checkout import CartLineInput, CheckoutError, UnauthorizedResourceError, create_pos_sale
 
 router = APIRouter(prefix="/sync", tags=["sync"])
 
@@ -85,6 +85,54 @@ def _get_or_create_device(db: Session, principal: Principal, fingerprint: str | 
     return device
 
 
+def _check_and_advance_device_sequence(db: Session, tenant_id: int, device: Device, sequence: int) -> None:
+    """
+    Phase 8.5 (CTO audit of 0cfd8ca, finding #19): "the server currently
+    doesn't enforce device sequence continuity ... this becomes important
+    when inventory and multi-device synchronization arrive." This
+    implements DETECTION now — recording a gap as a real, visible Conflict
+    row the moment it's seen — deliberately without yet BLOCKING
+    processing on a gap. Blocking here would mean a single delayed or
+    dropped event from one device could wedge every later event from that
+    same device indefinitely; for a POS whose worst failure mode must be
+    "sale eventually syncs late", refusing to process is worse than
+    recording and moving on. This is a disclosed scope decision, not a
+    partial implementation pretending to be complete — see PHASE-STATUS.md.
+    """
+    state = db.get(DeviceSyncState, device.id)
+    if state is None:
+        state = DeviceSyncState(device_id=device.id, last_sequence_received=0)
+        db.add(state)
+        db.flush()
+
+    expected_next = state.last_sequence_received + 1
+    if sequence > expected_next:
+        db.add(
+            Conflict(
+                tenant_id=tenant_id,
+                aggregate_type="device_sequence",
+                aggregate_id=str(device.id),
+                field="sequence",
+                local_value=str(expected_next),
+                remote_value=str(sequence),
+                resolution="PENDING",
+            )
+        )
+        state.failed_count += 1
+    elif sequence < expected_next:
+        # An out-of-order or replayed-late event. event_id idempotency
+        # (InboxEvent's UNIQUE constraint) already protects against
+        # double-processing the SAME event; this just means the sequence
+        # counter shouldn't move backwards for a genuinely older delivery.
+        pass
+
+    state.last_sequence_received = max(state.last_sequence_received, sequence)
+    import datetime as dt
+
+    state.last_synced_at = dt.datetime.utcnow()
+    db.flush()
+
+
 @router.post("/events", response_model=SyncEventResult)
 def ingest_sync_event(
     body: SyncEventIn,
@@ -119,6 +167,7 @@ def ingest_sync_event(
     # WITHOUT also rolling back the fact that we ever saw this event —
     # otherwise a failure would erase its own error trail.
     inbox_row = existing
+    is_first_receipt = inbox_row is None
     if inbox_row is None:
         inbox_row = InboxEvent(
             tenant_id=principal.tenant_id,
@@ -132,6 +181,12 @@ def ingest_sync_event(
             payload=body.payload,
         )
         db.add(inbox_row)
+    if is_first_receipt:
+        # Only advance the per-device sequence watermark the first time an
+        # event_id is ever seen — a retry of a previously-failed-to-process
+        # event (event exists, but processed_at is still NULL) must not
+        # advance it a second time.
+        _check_and_advance_device_sequence(db, principal.tenant_id, device, body.sequence)
     db.commit()
     db.refresh(inbox_row)
 
@@ -154,7 +209,17 @@ def ingest_sync_event(
             lines=[CartLineInput(int(l["product_id"]), int(l["quantity"])) for l in lines_payload],
             payment_method=PaymentMethod(body.payload.get("payment_method", "CASH")),
         )
-    except (CheckoutError, KeyError, ValueError) as exc:
+        # create_pos_sale only flushes now (finding #17) — this endpoint
+        # is the transaction boundary for the order/lines/payment/ledger
+        # it just built, exactly as it already was for the InboxEvent row
+        # above. Each is still its own transaction (recording "we received
+        # this event" must survive even if processing it fails), but
+        # within THIS step, everything create_pos_sale touched commits or
+        # rolls back together as one unit, rather than the two services
+        # each independently deciding when to commit.
+        db.commit()
+        db.refresh(order)
+    except (CheckoutError, UnauthorizedResourceError, KeyError, ValueError) as exc:
         # Undo any partially-flushed Order/OrderLine/InventoryLedger rows
         # from the failed create_pos_sale attempt BEFORE recording the
         # error — otherwise a broken half-written order (zero totals, no

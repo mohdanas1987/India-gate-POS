@@ -109,6 +109,18 @@ def change_status(
     if not wo or wo.tenant_id != principal.tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Website order not found")
 
+    # Store check (Phase 8.5 — CTO audit of 0cfd8ca, finding #27: the read
+    # path, list_website_orders(), already scopes by store when the caller
+    # is scoped to one store, but this mutation path did not — a Store 1
+    # user could change a Store 2 website order's status as long as both
+    # shared the same tenant. Same architectural family as findings #6/#7:
+    # a route must not stop at tenant scope when the caller is further
+    # scoped to a specific store.
+    if principal.store_id is not None:
+        underlying_order = db.get(Order, wo.order_id)
+        if not underlying_order or underlying_order.store_id != principal.store_id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Website order not found")
+
     try:
         target = WebsiteOrderStatus(body.new_status)
         current = WebsiteOrderStatus(wo.status)

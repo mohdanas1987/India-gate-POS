@@ -27,7 +27,8 @@ export function openLocalDb(filePath: string): Database.Database {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       synced_at TEXT,
       retry_count INTEGER NOT NULL DEFAULT 0,
-      last_error TEXT
+      last_error TEXT,
+      next_attempt_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS local_orders (
@@ -104,6 +105,17 @@ export function openLocalDb(filePath: string): Database.Database {
       cached_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+
+  // Phase 8.5 (CTO audit of 0cfd8ca, finding #18): next_attempt_at is new
+  // as of this fix. An existing local database created before this change
+  // already has an outbox_events table WITHOUT this column — SQLite's
+  // CREATE TABLE IF NOT EXISTS above is a no-op against it, so this
+  // migration check adds the column on top of whatever already exists.
+  // SQLite has no "ADD COLUMN IF NOT EXISTS", hence the manual PRAGMA check.
+  const existingColumns = db.prepare(`PRAGMA table_info(outbox_events)`).all() as { name: string }[];
+  if (!existingColumns.some((c) => c.name === "next_attempt_at")) {
+    db.exec(`ALTER TABLE outbox_events ADD COLUMN next_attempt_at TEXT NOT NULL DEFAULT (datetime('now'))`);
+  }
 
   return db;
 }
