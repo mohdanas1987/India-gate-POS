@@ -4,12 +4,32 @@
  * §9). These run in the Electron MAIN process only.
  */
 import { BrowserWindow } from "electron";
-import type { PrinterProvider, CashDrawerProvider, BarcodePrinterProvider } from "./types";
+import type { PrinterProvider, CashDrawerProvider, BarcodePrinterProvider, ReceiptData } from "./types";
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 
 export class ElectronPrinterProvider implements PrinterProvider {
   constructor(private logoBase64: string) {}
 
-  async printReceipt(html: string): Promise<void> {
+  /**
+   * CTO audit finding #18: `printReceipt(html)` used to accept an
+   * arbitrary HTML string straight from the renderer and hand it to the
+   * printer unrestricted — fine for a controlled first pass, but the
+   * finding is right that the final version shouldn't let a compromised
+   * or buggy renderer inject arbitrary printer content. This is the
+   * structured contract: the renderer sends DATA (order number, lines,
+   * totals), and the actual HTML is generated here, in the trusted main
+   * process, with every field escaped.
+   */
+  async printReceipt(receipt: ReceiptData): Promise<void> {
+    const rows = receipt.lines
+      .map(
+        (l) =>
+          `<tr><td>${escapeHtml(l.name)}</td><td>${l.quantity}</td><td>€${(l.lineTotalMinor / 100).toFixed(2)}</td></tr>`
+      )
+      .join("");
     const win = new BrowserWindow({ show: false });
     const full = `<html><style>
         @page{ size:auto; margin:-5mm 3mm 3mm 2mm }
@@ -17,7 +37,9 @@ export class ElectronPrinterProvider implements PrinterProvider {
       </style>
       <body style="width:32%!important;margin:0px!important;padding:0px!important;">
         <div style="text-align:center"><img src="data:image/png;base64,${this.logoBase64}" height="100"/></div>
-        ${html}
+        <h3>${escapeHtml(receipt.orderLabel)}</h3>
+        <table>${rows}</table>
+        <p><strong>Total: €${(receipt.totalMinor / 100).toFixed(2)}</strong></p>
         <p>Generated: ${new Date().toLocaleString()}</p>
       </body></html>`;
     await this.silentPrint(win, full);

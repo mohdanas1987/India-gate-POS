@@ -42,8 +42,18 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class Principal:
-    """The only source of truth for 'who is making this request'."""
+    """The only source of truth for 'who is making this request'.
+
+    CTO audit finding (commit c4bfb82): every route that needed a tenant id
+    was hardcoding `tenant_id=1` instead of deriving it from the
+    authenticated caller — a real multi-tenant-isolation bug, not just a
+    style issue (e.g. it would silently attribute a Store Manager's own
+    audit-log entries and orders to a hardcoded tenant that may not even be
+    theirs). Principal now carries tenant_id so every route has a single,
+    correct source for it — no route should ever write a literal `1`.
+    """
     user_id: int
+    tenant_id: int
     role: str
     store_id: int | None
 
@@ -52,7 +62,7 @@ class InvalidTokenError(Exception):
     pass
 
 
-def create_token(user_id: int, role: str, store_id: int | None, token_type: str = "access") -> str:
+def create_token(user_id: int, tenant_id: int, role: str, store_id: int | None, token_type: str = "access") -> str:
     settings = get_settings()
     now = dt.datetime.now(dt.timezone.utc)
     ttl = (
@@ -62,6 +72,7 @@ def create_token(user_id: int, role: str, store_id: int | None, token_type: str 
     )
     payload = {
         "sub": str(user_id),
+        "tenant_id": tenant_id,
         "role": role,
         "store_id": store_id,
         "type": token_type,
@@ -81,8 +92,14 @@ def decode_token(token: str, expected_type: str = "access") -> Principal:
     if payload.get("type") != expected_type:
         raise InvalidTokenError(f"expected token type {expected_type!r}, got {payload.get('type')!r}")
 
+    if "tenant_id" not in payload:
+        # Tokens issued before this fix don't carry tenant_id — reject them
+        # explicitly rather than silently defaulting to tenant 1 again.
+        raise InvalidTokenError("token missing tenant_id claim — re-authenticate")
+
     return Principal(
         user_id=int(payload["sub"]),
+        tenant_id=int(payload["tenant_id"]),
         role=payload["role"],
         store_id=payload.get("store_id"),
     )

@@ -28,14 +28,31 @@ await page.fill('input[type="email"]', "owner@indiagate.nl");
 await page.fill('input[type="password"]', "Sup3rSecret!");
 await page.click('button[type="submit"]');
 
+// This step is now self-contained regardless of whether Postgres already
+// has an open cashier session from earlier testing: the "Open Register"
+// screen (added during the CTO-audit remediation pass — see PosPage.tsx)
+// is handled here rather than relying on a session someone opened by hand
+// once and never closed, which is exactly the kind of hidden,
+// non-reproducible precondition the audit called out.
 try {
-  await page.waitForSelector('input[placeholder*="Search product"]', { timeout: 5000 });
-  console.log("STEP 2 OK: logged in, POS screen shown");
+  await Promise.race([
+    page.waitForSelector('input[placeholder*="Search product"]', { timeout: 8000 }),
+    page.waitForSelector("text=Open Register", { timeout: 8000 }),
+  ]);
 } catch (e) {
   console.log("DEBUG page content:", await page.content());
   console.log("DEBUG console errors so far:", errors);
   throw e;
 }
+
+const needsRegisterOpen = await page.locator("text=Open Register").count();
+if (needsRegisterOpen > 0) {
+  console.log("STEP 2a: no open cashier session found — opening one via the real UI");
+  await page.fill('input[placeholder="Opening cash (€)"]', "100.00");
+  await page.click('button:has-text("Open Register")');
+  await page.waitForSelector('input[placeholder*="Search product"]', { timeout: 8000 });
+}
+console.log("STEP 2 OK: logged in, POS screen shown (register open, real session in place)");
 
 await page.fill('input[placeholder*="Search product"]', "rice");
 await page.waitForSelector("text=Basmati Rice 5kg", { timeout: 5000 });

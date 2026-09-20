@@ -5,7 +5,7 @@
  * onStateChange callback (wired in main.tsx).
  */
 import { create } from "zustand";
-import type { ConnectivityState } from "../sync/outboxSync";
+import type { ConnectivityState } from "../../electron/sync/outboxSync";
 
 interface ConnectivityStore {
   state: ConnectivityState;

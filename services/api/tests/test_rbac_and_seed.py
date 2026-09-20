@@ -44,7 +44,7 @@ def test_identity_comes_only_from_verified_token_not_client_fields():
     """Regression test for the exact legacy bug found in Phase 0:
     /auth/getuser trusted req.body.id instead of the token subject. Here,
     decode_token only ever returns what was cryptographically signed."""
-    token = create_token(user_id=42, role="Cashier", store_id=1)
+    token = create_token(user_id=42, tenant_id=1, role="Cashier", store_id=1)
     principal = decode_token(token)
     assert principal.user_id == 42
     assert principal.role == "Cashier"

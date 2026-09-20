@@ -1,19 +1,37 @@
+import { useEffect, useState } from "react";
 import { HashRouter, Routes, Route, Link, Navigate } from "react-router-dom";
 import { PosPage } from "./pages/PosPage";
 import { WebsiteOrdersPage } from "./pages/WebsiteOrdersPage";
 import { LoginPage } from "./pages/LoginPage";
+import { isAuthenticated } from "./api/authedFetch";
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8100";
-
+/**
+ * Rebuilt during the CTO-audit remediation pass: this used to read
+ * `localStorage.getItem("igpos_dev_token")` synchronously, which broke
+ * the moment the token stopped living in localStorage inside Electron
+ * (see LoginPage.tsx / api/authedFetch.ts, finding #19). The check is now
+ * async and environment-aware, with an explicit loading state instead of
+ * assuming localStorage is where the answer always lives.
+ */
 function RequireAuth({ children }: { children: JSX.Element }) {
-  const token = localStorage.getItem("igpos_dev_token");
-  if (!token) return <Navigate to="/login" replace />;
+  const [state, setState] = useState<"checking" | "authed" | "anon">("checking");
+
+  useEffect(() => {
+    let cancelled = false;
+    isAuthenticated().then((authed) => {
+      if (!cancelled) setState(authed ? "authed" : "anon");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (state === "checking") return null;
+  if (state === "anon") return <Navigate to="/login" replace />;
   return children;
 }
 
 export function App() {
-  const token = localStorage.getItem("igpos_dev_token") ?? "";
-
   return (
     <HashRouter>
       <nav className="flex gap-4 p-2 border-b text-sm">
@@ -34,7 +52,7 @@ export function App() {
           path="/website-orders"
           element={
             <RequireAuth>
-              <WebsiteOrdersPage apiBase={API_BASE} token={token} />
+              <WebsiteOrdersPage />
             </RequireAuth>
           }
         />

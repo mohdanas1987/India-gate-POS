@@ -11,8 +11,29 @@
  * security posture around them is hardened (see main.ts).
  */
 
+/**
+ * Structured receipt contract (CTO audit finding #18): the renderer sends
+ * DATA, never raw HTML, for anything that reaches the physical printer via
+ * printReceipt — the trusted main process is what turns this into markup.
+ * `printReport` still takes raw HTML because reports are generated
+ * server/main-process-side already in every caller today; if a renderer-
+ * originated report ever needs printing, it should get the same
+ * structured treatment rather than reusing this escape hatch.
+ */
+export interface ReceiptLine {
+  name: string;
+  quantity: number;
+  lineTotalMinor: number;
+}
+
+export interface ReceiptData {
+  orderLabel: string;
+  lines: ReceiptLine[];
+  totalMinor: number;
+}
+
 export interface PrinterProvider {
-  printReceipt(html: string): Promise<void>;
+  printReceipt(receipt: ReceiptData): Promise<void>;
   printReport(html: string): Promise<void>;
 }
 

@@ -12,13 +12,14 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.rbac import require_permission
 from app.core.security import Principal
 from app.db.session import get_db
 from app.domain.authz import AuditLog
+from app.domain.orders import Order
 from app.domain.website import WebsiteOrder, WebsiteOrderStatus, WebsiteOrderStatusHistory
 from app.services.website_order_workflow import (
     InvalidTransitionError,
@@ -58,8 +59,21 @@ def list_website_orders(
     page: int = 1,
     page_size: int = 25,
 ):
-    """Server-side paginated (plan §28) — never load the whole table."""
-    q = select(WebsiteOrder)
+    """Server-side paginated (plan §28) — never load the whole table.
+
+    CTO audit fixes (commit c4bfb82):
+      - Tenant scope was entirely missing (any authenticated user of any
+        tenant could list every tenant's website orders). Now filtered by
+        principal.tenant_id, and additionally by store (via the underlying
+        Order.store_id) when the caller is scoped to a specific store.
+      - The count was previously `len(db.execute(q).scalars().all())` —
+        loading the ENTIRE matching result set into Python memory just to
+        count it, which does not scale past a small dev dataset. Replaced
+        with a real `SELECT COUNT(*)`.
+    """
+    q = select(WebsiteOrder).where(WebsiteOrder.tenant_id == principal.tenant_id)
+    if principal.store_id is not None:
+        q = q.join(Order, Order.id == WebsiteOrder.order_id).where(Order.store_id == principal.store_id)
     if status_filter:
         q = q.where(WebsiteOrder.status == status_filter)
     if search:
@@ -69,7 +83,7 @@ def list_website_orders(
             | (WebsiteOrder.customer_name.ilike(like))
             | (WebsiteOrder.customer_phone.ilike(like))
         )
-    total = len(db.execute(q).scalars().all())
+    total = db.execute(select(func.count()).select_from(q.subquery())).scalar_one()
     q = q.order_by(WebsiteOrder.id.desc()).offset((page - 1) * page_size).limit(page_size)
     items = db.execute(q).scalars().all()
     return PagedWebsiteOrders(
@@ -90,7 +104,9 @@ def change_status(
     principal: Principal = Depends(require_permission("website_orders.change_status")),
 ):
     wo = db.get(WebsiteOrder, website_order_id)
-    if not wo:
+    # Tenant check: previously missing, so any authenticated user of any
+    # tenant could change the status of another tenant's website order.
+    if not wo or wo.tenant_id != principal.tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Website order not found")
 
     try:
@@ -127,7 +143,7 @@ def change_status(
     )
     db.add(
         AuditLog(
-            tenant_id=1,  # single-tenant default for now; Phase 13 threads tenant through the principal
+            tenant_id=principal.tenant_id,
             user_id=principal.user_id,
             action="website_order.status_change",
             entity_type="website_order",

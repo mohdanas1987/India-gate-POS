@@ -3,6 +3,10 @@ import { useNavigate } from "react-router-dom";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8100";
 
+function isElectron(): boolean {
+  return typeof window !== "undefined" && !!window.electronAPI;
+}
+
 export function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -25,7 +29,28 @@ export function LoginPage() {
         throw new Error(body.detail ?? `Login failed (HTTP ${res.status})`);
       }
       const data = await res.json();
-      localStorage.setItem("igpos_dev_token", data.access_token);
+
+      if (isElectron()) {
+        // CTO audit finding #19: the access token used to be written to
+        // renderer localStorage, which is not acceptable for a production
+        // Electron app (any script that ran in the renderer, or anyone
+        // reading the app's on-disk storage, could read it). It now goes
+        // to the main process via IPC, which encrypts it at rest with the
+        // OS keychain (Electron's safeStorage) — see electron/main.ts.
+        // The renderer never sees it again after this call.
+        await window.electronAPI!.saveAuthToken(data.access_token);
+        const meRes = await window.electronAPI!.authedRequest({ path: "/api/v1/auth/me" });
+        if (meRes.ok) {
+          const me = meRes.body as { user_id: number; tenant_id: number; store_id: number | null; role: string };
+          await window.electronAPI!.saveAuthContext(me);
+        }
+      } else {
+        // Outside Electron (the Playwright smoke test's plain-browser
+        // renderer has no secure-storage IPC to call) localStorage remains
+        // the only place a token CAN live — disclosed limitation, not
+        // silently different behavior.
+        localStorage.setItem("igpos_dev_token", data.access_token);
+      }
       navigate("/pos");
     } catch (err) {
       setError((err as Error).message);

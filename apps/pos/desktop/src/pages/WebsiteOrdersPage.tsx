@@ -6,6 +6,7 @@
  */
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
+import { authedFetch } from "../api/authedFetch";
 
 interface WebsiteOrderRow {
   id: number;
@@ -31,25 +32,25 @@ const STATUS_FILTERS = [
   "REFUNDED",
 ];
 
-async function fetchWebsiteOrders(apiBase: string, token: string, status: string, search: string, page: number) {
+async function fetchWebsiteOrders(status: string, search: string, page: number) {
   const params = new URLSearchParams({ page: String(page), page_size: "25" });
   if (status !== "All") params.set("status", status);
   if (search) params.set("search", search);
-  const res = await fetch(`${apiBase}/api/v1/website-orders?${params}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) throw new Error(`Failed to load website orders: HTTP ${res.status}`);
-  return res.json() as Promise<{ items: WebsiteOrderRow[]; total: number; page: number; page_size: number }>;
+  const result = await authedFetch<{ items: WebsiteOrderRow[]; total: number; page: number; page_size: number }>(
+    `/api/v1/website-orders?${params}`
+  );
+  if (!result.ok) throw new Error(`Failed to load website orders: HTTP ${result.status}`);
+  return result.body;
 }
 
-export function WebsiteOrdersPage({ apiBase, token }: { apiBase: string; token: string }) {
+export function WebsiteOrdersPage() {
   const [status, setStatus] = useState("All");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["website-orders", status, search, page],
-    queryFn: () => fetchWebsiteOrders(apiBase, token, status, search, page),
+    queryFn: () => fetchWebsiteOrders(status, search, page),
   });
 
   return (
