@@ -68,6 +68,22 @@ class CartLineInput:
 
 
 @dataclass(frozen=True, slots=True)
+class PaymentInput:
+    """
+    Phase 22 (LedgerBrug dev-team question #2 — split payments). One
+    tender on a receipt: 10 EUR cash + 15 EUR by card is two of these, not
+    one payment_method with a total. `provider_reference` is where the
+    card network/PSP's own transaction id goes (CCV, Adyen, Rabobank,
+    whichever is picked — see PHASE-STATUS.md Phase 22) so the amount that
+    later lands on the bank statement can be matched back to this tender.
+    """
+
+    method: PaymentMethod
+    amount_minor: int
+    provider_reference: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class OrderTotals:
     subtotal_minor: int
     tax_minor: int
@@ -119,7 +135,8 @@ def create_pos_sale(
     register_id: int,
     cashier_user_id: int,
     lines: list[CartLineInput],
-    payment_method: PaymentMethod,
+    payment_method: PaymentMethod | None = None,
+    payments: list[PaymentInput] | None = None,
     currency: str = "EUR",
 ) -> Order:
     """
@@ -134,9 +151,19 @@ def create_pos_sale(
     entry outside this function's own AuditLog row, a website-order status
     update) inside exactly one atomic transaction, instead of two services
     each independently committing and stepping on each other.
+
+    Payment: pass EITHER `payment_method` (single tender for the full
+    total — the pre-Phase-22 behavior, kept so every existing caller and
+    test keeps working unchanged) OR `payments` (a list of PaymentInput
+    tenders — Phase 22, split payments). Exactly one must be given; the
+    split-payment path validates the tenders sum to exactly the computed
+    total before writing anything, so a client cannot under- or
+    over-tender a sale by mistake.
     """
     if not lines:
         raise InvalidCartError("Cart is empty")
+    if (payment_method is None) == (payments is None):
+        raise InvalidCartError("Pass exactly one of payment_method or payments, not both or neither")
 
     try:
         resolve_authorized_register(db, tenant_id, store_id, register_id)
@@ -185,6 +212,9 @@ def create_pos_sale(
                 quantity=line_input.quantity,
                 unit_price_minor=product.price_minor,
                 tax_minor=line_tax,
+                # Phase 22: snapshot the RATE, not just the resulting
+                # amount — see the field's docstring in app/domain/orders.py.
+                tax_rate_basis_points=tax.rate_basis_points if tax else 0,
                 line_total_minor=line_total,
             )
         )
@@ -209,7 +239,35 @@ def create_pos_sale(
     order.total_minor = total_minor
     order.status = OrderStatus.COMPLETED
 
-    db.add(OrderPayment(order_id=order.id, method=payment_method, amount_minor=total_minor))
+    # Phase 22 (dev-team question #3): a permanent, unique, barcode-ready
+    # receipt number, assigned once the order id (and therefore the
+    # number derived from it) is known and never changed afterward —
+    # including through a later void or refund, per the dev team's
+    # explicit requirement that a void keep its original receipt number.
+    order.receipt_number = f"{store_id:04d}-{register_id:03d}-{order.id:010d}"
+
+    if payments is not None:
+        if not payments:
+            raise InvalidCartError("At least one payment tender is required")
+        tendered_minor = sum(p.amount_minor for p in payments)
+        if tendered_minor != total_minor:
+            raise InvalidCartError(
+                f"Payment tenders sum to {tendered_minor} but the order total is {total_minor}"
+            )
+        for tender in payments:
+            if tender.amount_minor <= 0:
+                raise InvalidCartError("Each payment tender must be a positive amount")
+            db.add(
+                OrderPayment(
+                    order_id=order.id,
+                    method=tender.method,
+                    amount_minor=tender.amount_minor,
+                    provider_reference=tender.provider_reference,
+                )
+            )
+    else:
+        db.add(OrderPayment(order_id=order.id, method=payment_method, amount_minor=total_minor))
+
     db.add(
         AuditLog(
             tenant_id=tenant_id,

@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     # Extra category is excluded from website sync by explicit business rule.
     excluded_sync_category_names: tuple[str, ...] = ("Extra",)
 
+    # Phase 22 — LedgerBrug outbound webhook. Both blank by default: the
+    # sender (app/services/ledgerbrug.py::send_pending_events) is not
+    # wired to a scheduler yet, and the real URL/secret are LedgerBrug's
+    # to provide once their contract doc actually reaches us — leaving
+    # these unset is the honest state today, not a placeholder pretending
+    # to be configured.
+    ledgerbrug_webhook_url: str = ""
+    ledgerbrug_webhook_secret: str = ""
+
     # CORS allowlist for browser-based clients (Electron renderer via Vite
     # dev server, and later any web-based back-office). Dev default covers
     # the standard Vite ports on localhost/127.0.0.1; production must

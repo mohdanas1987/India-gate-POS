@@ -49,6 +49,24 @@ class Order(Base):
 
     status: Mapped[OrderStatus] = mapped_column(Enum(OrderStatus), default=OrderStatus.OPEN)
 
+    # Phase 22 (LedgerBrug integration readiness, dev-team question #3): a
+    # permanent, human/barcode-scannable receipt number, distinct from the
+    # internal `id`. Derived from (store, register, id) rather than a
+    # separately-tracked counter — deriving it from the already-atomic
+    # primary key means it inherits "permanent, unique, never reused" for
+    # free, with no separate race-prone sequence to get wrong. Nullable
+    # only because it is assigned by the service after the row (and its
+    # id) exist; every order created through create_pos_sale() has one.
+    receipt_number: Mapped[str | None] = mapped_column(String(40), nullable=True, unique=True)
+
+    # Phase 22, dev-team question #4 (cancellation/void): OrderStatus.VOIDED
+    # existed as an enum value with nothing behind it before this. A void
+    # keeps its original receipt_number (per the dev team's explicit ask)
+    # and records who/why/when, same audit shape as a refund.
+    voided_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    voided_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    voided_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     subtotal_minor: Mapped[int] = mapped_column(Integer, default=0)
     tax_minor: Mapped[int] = mapped_column(Integer, default=0)
     discount_minor: Mapped[int] = mapped_column(Integer, default=0)
@@ -76,6 +94,15 @@ class OrderLine(Base):
     quantity: Mapped[int] = mapped_column(Integer)  # for weighted items, quantity is grams (integer) not kg-float
     unit_price_minor: Mapped[int] = mapped_column(Integer)
     tax_minor: Mapped[int] = mapped_column(Integer, default=0)
+    # Phase 22 (LedgerBrug dev-team question #1 + the Z-report's "totals
+    # per VAT rate"): the tax AMOUNT was already stored per line, but not
+    # the RATE that produced it. Without this, a per-VAT-rate breakdown
+    # can only be reconstructed by re-joining to the product's CURRENT tax
+    # rate, which is wrong the moment a product's rate changes after the
+    # sale — the same historical-snapshot principle already applied to
+    # tax_minor itself (see checkout.py's module docstring). Nullable only
+    # for rows written before this column existed; every new line sets it.
+    tax_rate_basis_points: Mapped[int | None] = mapped_column(Integer, nullable=True)
     discount_minor: Mapped[int] = mapped_column(Integer, default=0)
     line_total_minor: Mapped[int] = mapped_column(Integer)
 

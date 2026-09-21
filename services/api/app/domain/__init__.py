@@ -9,3 +9,4 @@ from app.domain import cash  # noqa: F401
 from app.domain import website  # noqa: F401
 from app.domain import sync  # noqa: F401
 from app.domain import customer  # noqa: F401
+from app.domain import integrations  # noqa: F401

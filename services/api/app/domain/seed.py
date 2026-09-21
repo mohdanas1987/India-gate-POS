@@ -15,6 +15,7 @@ DEFAULT_PERMISSIONS = [
     "orders.create",
     "orders.refund",
     "orders.refund.override",
+    "orders.void",  # Phase 22 — same-day cashier void, distinct from refund
     "products.create",
     "products.update",
     "products.delete",
@@ -22,6 +23,7 @@ DEFAULT_PERMISSIONS = [
     "website_orders.change_status",
     "sync.manage",
     "reports.view",
+    "reports.day_close.finalize",  # Phase 22 — Z-report finalization (manager-level; X-report view uses reports.view)
     "admin.manage_users",
     "cash.manage_session",
 ]
@@ -35,15 +37,17 @@ DEFAULT_ROLE_PERMISSIONS = {
         "orders.create",
         "orders.refund",
         "orders.refund.override",
+        "orders.void",
         "products.create",
         "products.update",
         "website_orders.view",
         "website_orders.change_status",
         "sync.manage",
         "reports.view",
+        "reports.day_close.finalize",
         "cash.manage_session",
     ],
-    "Cashier": ["orders.create", "website_orders.view", "cash.manage_session"],
+    "Cashier": ["orders.create", "orders.void", "website_orders.view", "cash.manage_session"],
     "Inventory Manager": ["products.create", "products.update", "reports.view"],
     "Website Manager": ["website_orders.view", "website_orders.change_status", "sync.manage"],
 }

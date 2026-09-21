@@ -25,6 +25,8 @@ from app.core.rbac import require_permission
 from app.core.security import Principal
 from app.db.session import get_db
 from app.domain.authz import Approval
+from app.domain.orders import Order
+from app.services.ledgerbrug import enqueue_order_event
 from app.services.refunds import ApprovalError, RefundError, resolve_approval
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
@@ -73,6 +75,13 @@ def resolve_approval_route(
             resolver=principal,
             approve=body.approve,
         )
+        if body.approve and approval.status == "APPROVED":
+            # Phase 22: this is the point a manager-approved refund
+            # actually executes — enqueue the LedgerBrug event here, in
+            # the same transaction, same as the direct-refund path in
+            # orders.py.
+            order = db.get(Order, approval.context["order_id"])
+            enqueue_order_event(db, principal.tenant_id, order, "order.refunded")
         db.commit()
         db.refresh(approval)
     except (ApprovalError, RefundError) as exc:

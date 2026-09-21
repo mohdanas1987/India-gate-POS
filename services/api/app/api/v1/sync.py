@@ -40,7 +40,8 @@ from app.db.session import get_db
 from app.domain.orders import PaymentMethod
 from app.domain.sync import Conflict, DeviceSyncState, InboxEvent
 from app.domain.tenancy import Device
-from app.services.checkout import CartLineInput, CheckoutError, UnauthorizedResourceError, create_pos_sale
+from app.services.checkout import CartLineInput, CheckoutError, PaymentInput, UnauthorizedResourceError, create_pos_sale
+from app.services.ledgerbrug import enqueue_order_event
 
 router = APIRouter(prefix="/sync", tags=["sync"])
 
@@ -200,15 +201,36 @@ def ingest_sync_event(
         lines_payload = body.payload.get("lines", [])
         if not lines_payload:
             raise CheckoutError("order.created event carried no cart lines")
-        order = create_pos_sale(
-            db,
-            tenant_id=principal.tenant_id,
-            store_id=principal.store_id,
-            register_id=int(body.payload["register_id"]),
-            cashier_user_id=principal.user_id,
-            lines=[CartLineInput(int(l["product_id"]), int(l["quantity"])) for l in lines_payload],
-            payment_method=PaymentMethod(body.payload.get("payment_method", "CASH")),
-        )
+        payments_payload = body.payload.get("payments")
+        if payments_payload:
+            # Phase 22: an offline sale rung up with a split payment.
+            order = create_pos_sale(
+                db,
+                tenant_id=principal.tenant_id,
+                store_id=principal.store_id,
+                register_id=int(body.payload["register_id"]),
+                cashier_user_id=principal.user_id,
+                lines=[CartLineInput(int(l["product_id"]), int(l["quantity"])) for l in lines_payload],
+                payments=[
+                    PaymentInput(
+                        PaymentMethod(p["method"]), int(p["amount_minor"]), p.get("provider_reference")
+                    )
+                    for p in payments_payload
+                ],
+            )
+        else:
+            order = create_pos_sale(
+                db,
+                tenant_id=principal.tenant_id,
+                store_id=principal.store_id,
+                register_id=int(body.payload["register_id"]),
+                cashier_user_id=principal.user_id,
+                lines=[CartLineInput(int(l["product_id"]), int(l["quantity"])) for l in lines_payload],
+                payment_method=PaymentMethod(body.payload.get("payment_method", "CASH")),
+            )
+        # Phase 22: same atomic-with-the-order enqueue as the direct
+        # checkout path (app/api/v1/orders.py).
+        enqueue_order_event(db, principal.tenant_id, order, "order.completed")
         # create_pos_sale only flushes now (finding #17) — this endpoint
         # is the transaction boundary for the order/lines/payment/ledger
         # it just built, exactly as it already was for the InboxEvent row

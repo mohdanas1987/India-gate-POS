@@ -33,6 +33,7 @@ class LedgerEventType(str, enum.Enum):
     STOCK_COUNT = "STOCK_COUNT"
     WEBSITE_RESERVATION = "WEBSITE_RESERVATION"  # reserved but not yet decremented — see reservations note below
     WEBSITE_RESERVATION_RELEASE = "WEBSITE_RESERVATION_RELEASE"
+    VOID = "VOID"  # Phase 22 — same-day cashier void reverses the SALE row's stock decrement
 
 
 class InventoryLedger(Base):
