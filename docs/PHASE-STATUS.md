@@ -45,8 +45,11 @@ The audit's own language for this finding ("this becomes important when inventor
 | 16 (device revocation) | No refresh-token revocation list | The refresh endpoint now exists and rotates tokens, but a stolen refresh token cannot be individually revoked before it expires. |
 | — | Set `main` as the GitHub repository's default branch | This is a one-click GitHub repository setting (Settings → General → the pencil next to the default branch), not something reachable from either the build environment or the Mac's local git credentials used to push this commit — it needs to be done once, directly, by whoever has admin access to the repository. |
 | — | Confirm GitHub Actions is actually green on this commit | Same limitation as after the previous audit: the workflow's exact steps were reproduced locally (`pytest tests/ -v` with the CI's own `PYTHONPATH`, all 75 tests passing — see below), but an actual GitHub Actions run has not been separately triggered or confirmed from this environment. |
-| — | Security/secret scanning in CI | Not added this pass — a real gap, not fabricated as done. |
 | — | Full local-first POS domain (categories, discounts, customers, inventory projection, payment config, etc. all available offline) | Unchanged from the previous audit's disclosed limitation — the offline catalog remains a checkout-sized snapshot, not a complete local domain. |
+
+### Security/secret scanning in CI — FIXED (commit `b1481f8`)
+
+Originally listed above as a disclosed, unaddressed gap. Closed with two free additions (no paid CI/CD add-on, matching this project's existing "GitHub-hosted runners with a free Postgres service container" constraint): a `secret-scan` job in `.github/workflows/ci.yml` running `gitleaks/gitleaks-action@v2` against the full git history on push and the diff on a pull request (free for public repositories, no license key needed), and a new `.github/dependabot.yml` for weekly dependency-update scanning across the `pip`, `npm`, and `github-actions` ecosystems. Verified locally before shipping it: `gitleaks detect --source . --no-git` against the current working tree reports zero leaks, so this scanner isn't being turned on blind against a repository that would immediately need a wave of suppressions.
 
 ### What was actually run to verify this, not just written
 
