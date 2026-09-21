@@ -1,0 +1,24 @@
+# Phase 8.5 gate, P1 (CTO audit of 0cfd8ca, disclosed gap: "security/secret
+# scanning in CI ... not added this pass"). Dependabot's dependency-update
+# alerts are free on GitHub for any repository and need no separate
+# license or paid plan — closing the other half of the "no CI security
+# coverage at all" gap alongside the gitleaks secret-scanning job in
+# .github/workflows/ci.yml. Weekly rather than daily: a POS at this stage
+# doesn't need same-day dependency PRs, and weekly keeps the PR volume
+# something a small team can actually review.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/services/api"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "npm"
+    directory: "/apps/pos/desktop"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

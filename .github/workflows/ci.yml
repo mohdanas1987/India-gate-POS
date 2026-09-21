@@ -54,3 +54,23 @@ jobs:
       - name: Typecheck electron main
         working-directory: apps/pos/desktop
         run: npx tsc -p electron/tsconfig.json --noEmit
+
+  # Phase 8.5 gate, P1 (CTO audit of 0cfd8ca, disclosed gap: "security/secret
+  # scanning in CI ... not added this pass"). gitleaks scans the diff on a PR
+  # and the full history on a push to main, for accidentally committed
+  # secrets (API keys, the JWT secret, DB passwords, etc.) — the exact class
+  # of mistake a hardcoded-secret POS has already been burned by once (see
+  # the Phase 0 audit's hardcoded JWT secret finding). gitleaks-action is
+  # free for public repositories (this repo is public per the previous
+  # audit) and needs no license key or paid add-on, matching this project's
+  # existing "no paid CI/CD add-ons" constraint (plan §97, see the header
+  # comment on this file).
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
