@@ -126,6 +126,27 @@ def search_products(
     return [ProductOut.from_product(p, taxes) for p in products]
 
 
+@router.get("/{product_id}", response_model=ProductOut)
+def get_product(
+    product_id: int,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_permission("orders.create")),
+):
+    """
+    Phase 9B: recalling a held cart needs to rebuild full cart lines
+    (name/price/tax/weighted-ness) from just the {product_id, quantity,
+    discount_minor} a held cart stores — this is the lookup that makes
+    that possible without re-running a full search. "/{product_id}" and
+    "/barcode/{code}" never collide (one path segment vs. two), so
+    declaration order between them doesn't matter here.
+    """
+    product = db.get(Product, product_id)
+    if not product or product.is_deleted or product.tenant_id != principal.tenant_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Product not found")
+    tax = db.get(Tax, product.tax_id) if product.tax_id else None
+    return ProductOut.from_product(product, {tax.id: tax} if tax else {})
+
+
 @router.get("/barcode/{code}", response_model=ProductOut)
 def lookup_by_barcode(
     code: str,

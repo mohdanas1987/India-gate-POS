@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from app.api.v1.categories import list_categories
-from app.api.v1.products import search_products
+from app.api.v1.products import get_product, search_products
 from app.core.security import Principal
 from app.domain.authz import User
 from app.domain.catalog import Barcode, Category, Product, Tax
@@ -93,6 +93,35 @@ def test_search_does_not_duplicate_a_product_with_multiple_barcodes(db, catalog_
 def test_product_out_carries_category_id(db, catalog_setup):
     results = search_products(q="Rice", category_id=None, limit=50, db=db, principal=catalog_setup["principal"])
     assert results[0].category_id == catalog_setup["grocery"].id
+
+
+def test_get_product_by_id_returns_the_right_product(db, catalog_setup):
+    """Phase 9B: recalling a held cart needs to rebuild full line detail
+    from just a product_id — this is that lookup."""
+    result = get_product(catalog_setup["rice"].id, db=db, principal=catalog_setup["principal"])
+    assert result.id == catalog_setup["rice"].id
+    assert result.name == "Basmati Rice 1kg"
+
+
+def test_get_product_by_id_is_tenant_scoped(db, catalog_setup):
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    from app.domain.seed import seed_all as _seed_all
+    from app.domain.tenancy import Tenant
+
+    other_tenant = Tenant(name="Other Tenant For Product Lookup")
+    db.add(other_tenant)
+    db.flush()
+    from app.domain.catalog import Product as _Product
+
+    other_product = _Product(tenant_id=other_tenant.id, name="Cross Tenant Product", price_minor=100, currency="EUR")
+    db.add(other_product)
+    db.commit()
+
+    with _pytest.raises(HTTPException) as exc_info:
+        get_product(other_product.id, db=db, principal=catalog_setup["principal"])
+    assert exc_info.value.status_code == 404
 
 
 def test_cursor_pagination_pages_through_the_full_catalog_with_no_gaps_or_duplicates(db, catalog_setup):

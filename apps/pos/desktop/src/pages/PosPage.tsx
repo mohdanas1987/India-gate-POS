@@ -30,6 +30,8 @@ import { ConnectivityBadge } from "../components/ConnectivityBadge";
 import { CategorySidebar, CategoryDto } from "../components/CategorySidebar";
 import { CartPanel, CartLine } from "../components/CartPanel";
 import { WeightEntryDialog } from "../components/WeightEntryDialog";
+import { CustomerPicker, CustomerDto } from "../components/CustomerPicker";
+import { HeldCartsDialog, HeldCartSummary } from "../components/HeldCartsDialog";
 import { computeLineTotal, formatMoney } from "../lib/pricing";
 import { generateCartLineId } from "../lib/cartLineId";
 import { authedFetch, isElectron } from "../api/authedFetch";
@@ -54,6 +56,22 @@ interface OrderDto {
   total_minor: number;
 }
 
+interface DiscountApprovalDetail {
+  message: string;
+  action_code: string;
+  threshold_minor_units: number | null;
+  approval_id: number;
+}
+
+/** Thrown when a checkout is blocked pending manager approval of a
+ * discount (Phase 9B) — carries the approval id so the UI can tell the
+ * cashier a manager needs to act, rather than showing a generic error. */
+class DiscountApprovalRequiredError extends Error {
+  constructor(public detail: DiscountApprovalDetail) {
+    super(detail.message);
+  }
+}
+
 interface OpenSessionDto {
   id: number;
   register_id: number;
@@ -76,17 +94,69 @@ async function listCategoriesOnline(): Promise<CategoryDto[]> {
   return result.body;
 }
 
-async function submitOrderOnline(lines: CartLine[]): Promise<OrderDto> {
-  const result = await authedFetch<OrderDto & { detail?: string }>("/api/v1/orders", {
+async function submitOrderOnline(lines: CartLine[], customerId: number | null): Promise<OrderDto> {
+  const result = await authedFetch<OrderDto & { detail?: string | DiscountApprovalDetail }>("/api/v1/orders", {
     method: "POST",
     body: {
       register_id: DEFAULT_REGISTER_ID,
-      lines: lines.map((l) => ({ product_id: l.productId, quantity: l.quantity })),
+      lines: lines.map((l) => ({ product_id: l.productId, quantity: l.quantity, discount_minor: l.discountMinor })),
+      customer_id: customerId,
     },
   });
   if (!result.ok) {
-    throw new Error(typeof result.body?.detail === "string" ? result.body.detail : `Checkout failed: HTTP ${result.status}`);
+    // Phase 9B: a discount over the configured threshold comes back as a
+    // structured 403 (see orders.py's DiscountRequiresApprovalError
+    // handling) rather than a plain string — surfaced distinctly so the
+    // UI can tell the cashier "a manager needs to approve this" instead
+    // of a generic checkout-failed message.
+    if (result.status === 403 && result.body?.detail && typeof result.body.detail === "object" && "approval_id" in result.body.detail) {
+      throw new DiscountApprovalRequiredError(result.body.detail as DiscountApprovalDetail);
+    }
+    const detail = result.body?.detail;
+    throw new Error(typeof detail === "string" ? detail : `Checkout failed: HTTP ${result.status}`);
   }
+  return result.body;
+}
+
+async function searchCustomersOnline(q: string): Promise<CustomerDto[]> {
+  const result = await authedFetch<CustomerDto[]>(`/api/v1/customers?q=${encodeURIComponent(q)}`);
+  if (!result.ok) return [];
+  return result.body;
+}
+
+async function createCustomerOnline(name: string, phone: string): Promise<CustomerDto> {
+  const result = await authedFetch<CustomerDto>("/api/v1/customers", { method: "POST", body: { name, phone: phone || null } });
+  if (!result.ok) throw new Error(`Could not create customer: HTTP ${result.status}`);
+  return result.body;
+}
+
+async function holdCartOnline(lines: CartLine[], customerId: number | null): Promise<void> {
+  const result = await authedFetch("/api/v1/carts/hold", {
+    method: "POST",
+    body: {
+      register_id: DEFAULT_REGISTER_ID,
+      customer_id: customerId,
+      lines: lines.map((l) => ({ product_id: l.productId, quantity: l.quantity, discount_minor: l.discountMinor })),
+    },
+  });
+  if (!result.ok) throw new Error(`Could not hold cart: HTTP ${result.status}`);
+}
+
+async function listHeldCartsOnline(): Promise<HeldCartSummary[]> {
+  const result = await authedFetch<HeldCartSummary[]>("/api/v1/carts/held");
+  if (!result.ok) throw new Error(`Could not list held carts: HTTP ${result.status}`);
+  return result.body;
+}
+
+async function recallHeldCartOnline(id: number): Promise<HeldCartSummary> {
+  const result = await authedFetch<HeldCartSummary>(`/api/v1/carts/held/${id}/recall`, { method: "POST" });
+  if (!result.ok) throw new Error(`Could not recall held cart: HTTP ${result.status}`);
+  return result.body;
+}
+
+async function getProductByIdOnline(id: number): Promise<ProductDto> {
+  const result = await authedFetch<ProductDto>(`/api/v1/products/${id}`);
+  if (!result.ok) throw new Error(`Could not resolve product ${id}: HTTP ${result.status}`);
   return result.body;
 }
 
@@ -134,7 +204,8 @@ async function triggerHardwareForCompletedSale(orderLabel: string, lines: CartLi
       lines: lines.map((l) => {
         const { totalMinor: lineTotal } = computeLineTotal(
           { price_minor: l.unitPriceMinor, currency: l.currency, is_weighted: l.isWeighted, tax_rate_basis_points: l.taxRateBasisPoints },
-          l.quantity
+          l.quantity,
+          l.discountMinor
         );
         return { name: l.name, quantity: l.quantity, lineTotalMinor: lineTotal };
       }),
@@ -161,6 +232,11 @@ export function PosPage() {
   const [focusedProductIndex, setFocusedProductIndex] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
+  // Phase 9B: customer attach + suspended carts.
+  const [selectedCustomer, setSelectedCustomer] = useState<CustomerDto | null>(null);
+  const [heldCartsOpen, setHeldCartsOpen] = useState(false);
+  const [heldCarts, setHeldCarts] = useState<HeldCartSummary[]>([]);
+  const [holdError, setHoldError] = useState<string | null>(null);
 
   // On mount: figure out whether a session is already open, checking the
   // local cache first (works offline) and falling back to the server.
@@ -200,11 +276,18 @@ export function PosPage() {
       if (e.key === "F1") {
         e.preventDefault();
         searchInputRef.current?.focus();
+      } else if (e.key === "F3") {
+        e.preventDefault();
+        void handleHoldCart();
+      } else if (e.key === "F4") {
+        e.preventDefault();
+        void handleOpenHeldCarts();
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cart, selectedCustomer]);
 
   async function handleOpenRegister(e: React.FormEvent) {
     e.preventDefault();
@@ -332,24 +415,42 @@ export function PosPage() {
   const checkoutMutation = useMutation({
     mutationFn: async () => {
       if (isElectron()) {
+        // Phase 9B: offline checkout (electron/offlineCheckout.ts) doesn't
+        // yet support discounts — there's no live manager to approve one
+        // while offline, and silently dropping a discount the cashier
+        // already entered would overcharge the customer. Refuse up front
+        // with a clear message rather than ringing up the wrong total.
+        if (cart.some((l) => l.discountMinor > 0)) {
+          throw new Error("Discounts require an online connection (a manager may need to approve). Reconnect or remove the discount to complete this sale offline.");
+        }
         const result = await window.electronAPI!.checkoutOffline(
           cart.map((l) => ({ productId: l.productId, quantity: l.quantity }))
         );
         if (!result.ok) throw new Error(result.error);
         return { label: `Order (offline, syncing) #${result.receipt.localOrderId.slice(0, 8)}`, totalMinor: result.receipt.totalMinor };
       }
-      const order = await submitOrderOnline(cart);
+      const order = await submitOrderOnline(cart, selectedCustomer?.id ?? null);
       return { label: `Order #${order.id}`, totalMinor: order.total_minor };
     },
     onSuccess: ({ label, totalMinor }) => {
       const soldLines = cart;
       setCart([]);
       setSelectedLineId(null);
+      setSelectedCustomer(null);
       setLastReceipt(`${label} — total ${formatMoney(totalMinor)}`);
       queryClient.invalidateQueries({ queryKey: ["products"] });
       void triggerHardwareForCompletedSale(label, soldLines, totalMinor);
     },
   });
+
+  // Phase 9B: a discount over the configured threshold doesn't fail the
+  // sale outright — it creates a real Approval a manager resolves later
+  // (see app/services/discounts.py). Surfaced distinctly from a generic
+  // checkout error so the cashier knows to call a manager over, not retry.
+  const discountApprovalPending =
+    checkoutMutation.isError && checkoutMutation.error instanceof DiscountApprovalRequiredError
+      ? (checkoutMutation.error as DiscountApprovalRequiredError).detail
+      : null;
 
   function addToCart(p: ProductDto, quantity = 1) {
     setCart((prev) => {
@@ -378,6 +479,7 @@ export function PosPage() {
           currency: p.currency,
           isWeighted: p.is_weighted,
           taxRateBasisPoints: p.tax_rate_basis_points,
+          discountMinor: 0,
         },
       ];
     });
@@ -406,6 +508,74 @@ export function PosPage() {
   function clearCart() {
     setCart([]);
     setSelectedLineId(null);
+  }
+
+  function changeCartDiscount(lineId: string, discountMinor: number) {
+    setCart((prev) => prev.map((l) => (l.lineId === lineId ? { ...l, discountMinor } : l)));
+  }
+
+  // Phase 9B: F3 Hold — snapshot the current cart server-side and clear the
+  // register for the next customer. Held carts are online-only (a manager
+  // recalling one on another terminal is the whole point), so this always
+  // goes through authedFetch's online path — which works transparently
+  // whether or not this renderer is inside Electron (see authedFetch.ts).
+  async function handleHoldCart() {
+    if (cart.length === 0) return;
+    setHoldError(null);
+    try {
+      await holdCartOnline(cart, selectedCustomer?.id ?? null);
+      setCart([]);
+      setSelectedLineId(null);
+      setSelectedCustomer(null);
+    } catch (err) {
+      setHoldError((err as Error).message);
+    }
+  }
+
+  // Phase 9B: F4 Recall — open the held-carts dialog, loading the current
+  // list from the server first so it's never stale.
+  async function handleOpenHeldCarts() {
+    setHoldError(null);
+    try {
+      const list = await listHeldCartsOnline();
+      setHeldCarts(list);
+      setHeldCartsOpen(true);
+    } catch (err) {
+      setHoldError((err as Error).message);
+    }
+  }
+
+  // Recalling only gives back {product_id, quantity, discount_minor} — the
+  // held cart doesn't carry full product detail (name/price/tax could have
+  // changed since it was held), so each line's product is re-resolved via
+  // GET /api/v1/products/{id} to rebuild a proper CartLine with a FRESH
+  // lineId (the old line identity doesn't need to survive the round trip).
+  async function handleRecallCart(id: number) {
+    setHoldError(null);
+    try {
+      const recalled = await recallHeldCartOnline(id);
+      const products = await Promise.all(recalled.lines.map((l) => getProductByIdOnline(l.product_id)));
+      const newLines: CartLine[] = recalled.lines.map((l, i) => {
+        const p = products[i];
+        return {
+          lineId: generateCartLineId(),
+          productId: p.id,
+          name: p.name,
+          quantity: l.quantity,
+          unitPriceMinor: p.price_minor,
+          currency: p.currency,
+          isWeighted: p.is_weighted,
+          taxRateBasisPoints: p.tax_rate_basis_points,
+          discountMinor: l.discount_minor,
+        };
+      });
+      setCart(newLines);
+      setSelectedLineId(null);
+      setHeldCartsOpen(false);
+    } catch (err) {
+      setHoldError((err as Error).message);
+      setHeldCartsOpen(false);
+    }
   }
 
   // Phase 9A "scanner input" support: a barcode scanner is, functionally,
@@ -452,18 +622,23 @@ export function PosPage() {
 
   const totals = cart.reduce(
     (acc, l) => {
-      const { subtotalMinor, taxMinor, totalMinor } = computeLineTotal(
+      const { subtotalMinor, discountAppliedMinor, taxMinor, totalMinor } = computeLineTotal(
         { price_minor: l.unitPriceMinor, currency: l.currency, is_weighted: l.isWeighted, tax_rate_basis_points: l.taxRateBasisPoints },
-        l.quantity
+        l.quantity,
+        l.discountMinor
       );
-      acc.subtotalMinor += subtotalMinor;
+      // Footer "Subtotal" is shown PRE-discount (raw line price x qty) so
+      // the separate "Discount" line below actually means something —
+      // computeLineTotal's own subtotalMinor is already post-discount
+      // (that's what the cart table's "Price" column shows per line).
+      acc.subtotalMinor += subtotalMinor + discountAppliedMinor;
+      acc.discountMinor += discountAppliedMinor;
       acc.taxMinor += taxMinor;
       acc.totalMinor += totalMinor;
       return acc;
     },
-    { subtotalMinor: 0, taxMinor: 0, totalMinor: 0 }
+    { subtotalMinor: 0, discountMinor: 0, taxMinor: 0, totalMinor: 0 }
   );
-  const discountMinor = 0; // Phase 9B scope — shown for visibility per the CTO plan, not yet computable here.
   const currency = cart[0]?.currency ?? "EUR";
 
   if (!sessionChecked) {
@@ -539,15 +714,32 @@ export function PosPage() {
 
         <aside data-testid="cart-summary" className="p-3 overflow-y-auto flex flex-col">
           {lastReceipt && <p className="text-sm text-green-700 mb-2">{lastReceipt}</p>}
-          {checkoutMutation.isError && (
-            <p className="text-sm text-red-600 mb-2">{(checkoutMutation.error as Error).message}</p>
+          {holdError && <p className="text-sm text-red-600 mb-2">{holdError}</p>}
+          {discountApprovalPending ? (
+            <p className="text-sm text-amber-700 mb-2" data-testid="discount-approval-pending">
+              Discount needs manager approval (request #{discountApprovalPending.approval_id}). Ask a manager to
+              approve it from the Approvals screen, then retry the sale.
+            </p>
+          ) : (
+            checkoutMutation.isError && (
+              <p className="text-sm text-red-600 mb-2">{(checkoutMutation.error as Error).message}</p>
+            )
           )}
+          <div className="mb-2">
+            <CustomerPicker
+              selected={selectedCustomer}
+              onSelect={setSelectedCustomer}
+              onSearch={searchCustomersOnline}
+              onCreate={createCustomerOnline}
+            />
+          </div>
           <div className="flex-1">
             <CartPanel
               lines={cart}
               selectedLineId={selectedLineId}
               onSelectLine={setSelectedLineId}
               onChangeQuantity={changeCartQuantity}
+              onChangeDiscount={changeCartDiscount}
               onRemoveLine={removeCartLine}
               onClearCart={clearCart}
             />
@@ -559,7 +751,7 @@ export function PosPage() {
             </div>
             <div className="flex justify-between text-gray-500">
               <span>Discount</span>
-              <span>{formatMoney(discountMinor, currency)}</span>
+              <span>{formatMoney(totals.discountMinor, currency)}</span>
             </div>
             <div className="flex justify-between text-gray-500">
               <span>Tax</span>
@@ -582,15 +774,42 @@ export function PosPage() {
           <button className="w-full px-4 py-2 bg-gray-200 rounded mt-2" disabled>
             CARD (mock provider — Phase 10 gateway pending)
           </button>
+          <div className="flex gap-2 mt-2">
+            <button
+              type="button"
+              data-testid="hold-cart-button"
+              className="flex-1 px-3 py-1.5 border rounded text-sm disabled:opacity-50"
+              disabled={cart.length === 0}
+              onClick={() => void handleHoldCart()}
+            >
+              Hold (F3)
+            </button>
+            <button
+              type="button"
+              data-testid="recall-cart-button"
+              className="flex-1 px-3 py-1.5 border rounded text-sm"
+              onClick={() => void handleOpenHeldCarts()}
+            >
+              Recall (F4)
+            </button>
+          </div>
         </aside>
       </div>
 
       <footer className="border-t px-3 py-1.5 text-xs text-gray-400 flex gap-4">
         <span>F1 Search</span>
-        <span className="opacity-40">F3 Hold (Phase 9B)</span>
-        <span className="opacity-40">F4 Recall (Phase 9B)</span>
+        <span>F3 Hold</span>
+        <span>F4 Recall</span>
         <span>↑↓ navigate results · Enter add · Esc clear search</span>
       </footer>
+
+      {heldCartsOpen && (
+        <HeldCartsDialog
+          heldCarts={heldCarts}
+          onRecall={(id) => void handleRecallCart(id)}
+          onClose={() => setHeldCartsOpen(false)}
+        />
+      )}
 
       {weightDialogProduct && (
         <WeightEntryDialog

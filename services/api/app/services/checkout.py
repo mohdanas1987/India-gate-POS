@@ -65,6 +65,18 @@ class UnauthorizedResourceError(CheckoutError):
 class CartLineInput:
     product_id: int
     quantity: int  # for weighted products this is grams; validated by caller/UI
+    # Phase 9B: a flat amount (minor units) knocked off THIS line's
+    # subtotal before its own tax is computed — i.e. the discount reduces
+    # the taxable base, not just the final total, which is the correct
+    # VAT treatment (a discounted sale is taxed on what was actually
+    # charged). A CART-level discount (spread proportionally across
+    # lines with different tax rates) is deliberately NOT implemented in
+    # this pass — doing that correctly interacts with the Phase 22 X/Z
+    # report's per-VAT-rate breakdown in a way that deserves its own
+    # scrutiny, not a rushed addition here. Line-level discounts cover
+    # the common "10% off this item" / "managers markdown" cases without
+    # that risk.
+    discount_minor: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,8 +106,19 @@ class OrderTotals:
 _GRAMS_PER_KILO = 1000
 
 
-def compute_line_total(product: Product, tax: Tax | None, quantity: int) -> tuple[int, int, int]:
-    """Returns (line_subtotal_minor, line_tax_minor, line_total_minor).
+def compute_line_total(
+    product: Product, tax: Tax | None, quantity: int, discount_minor: int = 0
+) -> tuple[int, int, int, int]:
+    """Returns (line_subtotal_minor, line_discount_applied_minor, line_tax_minor, line_total_minor).
+
+    Phase 9B: `discount_minor` is clamped so a line can never go negative
+    — a discount larger than the line's own subtotal (a data-entry
+    mistake, or a stale line from a since-changed price) reduces the
+    charge to zero rather than producing a negative subtotal/tax, which
+    would be a real accounting bug (a "sale" that pays the customer).
+    The actual amount applied (possibly less than requested, if clamped)
+    is returned as the second value so the caller can record what
+    genuinely happened rather than what was asked for.
 
     Phase 9A finding: `OrderLine.quantity`'s own docstring ("for weighted
     items, quantity is grams, integer, not kg-float") and
@@ -132,8 +155,17 @@ def compute_line_total(product: Product, tax: Tax | None, quantity: int) -> tupl
     else:
         unit_price = Money(product.price_minor, product.currency)
         line_subtotal = unit_price * quantity
-    line_tax = line_subtotal.percentage(tax.rate_basis_points / 100) if tax else Money(0, product.currency)
-    return line_subtotal.minor_units, line_tax.minor_units, (line_subtotal + line_tax).minor_units
+
+    applied_discount_minor = max(0, min(discount_minor, line_subtotal.minor_units))
+    discounted_subtotal = Money(line_subtotal.minor_units - applied_discount_minor, product.currency)
+
+    line_tax = discounted_subtotal.percentage(tax.rate_basis_points / 100) if tax else Money(0, product.currency)
+    return (
+        discounted_subtotal.minor_units,
+        applied_discount_minor,
+        line_tax.minor_units,
+        (discounted_subtotal + line_tax).minor_units,
+    )
 
 
 def get_open_session(db: Session, tenant_id: int, store_id: int, register_id: int) -> CashierSession:
@@ -173,6 +205,7 @@ def create_pos_sale(
     payment_method: PaymentMethod | None = None,
     payments: list[PaymentInput] | None = None,
     currency: str = "EUR",
+    customer_id: int | None = None,
 ) -> Order:
     """
     NOTE on transaction ownership (CTO audit of 0cfd8ca, finding #17 —
@@ -207,11 +240,23 @@ def create_pos_sale(
 
     session = get_open_session(db, tenant_id, store_id, register_id)
 
+    # Phase 9B: a customer_id, if given, must belong to this tenant — same
+    # "prove ownership, don't just trust the id" discipline as product_id
+    # below, rather than a bare db.get() that would let Tenant A attach
+    # Tenant B's customer record to a sale.
+    if customer_id is not None:
+        from app.domain.customer import Customer
+
+        customer = db.query(Customer).filter(Customer.id == customer_id, Customer.tenant_id == tenant_id).first()
+        if not customer:
+            raise InvalidCartError(f"Customer {customer_id} not found")
+
     order = Order(
         tenant_id=tenant_id,
         store_id=store_id,
         register_id=register_id,
         cashier_user_id=cashier_user_id,
+        customer_id=customer_id,
         sales_channel=SalesChannel.POS,
         status=OrderStatus.OPEN,
         currency=currency,
@@ -221,6 +266,7 @@ def create_pos_sale(
 
     subtotal_minor = 0
     tax_minor = 0
+    discount_minor_total = 0
 
     for line_input in lines:
         # CTO audit of 0cfd8ca, finding #6 (RELEASE BLOCKER): this used to
@@ -238,7 +284,9 @@ def create_pos_sale(
             raise InvalidCartError(f"Product {line_input.product_id} not found or deleted")
 
         tax = db.get(Tax, product.tax_id) if product.tax_id else None
-        line_sub, line_tax, line_total = compute_line_total(product, tax, line_input.quantity)
+        line_sub, line_discount_applied, line_tax, line_total = compute_line_total(
+            product, tax, line_input.quantity, line_input.discount_minor
+        )
 
         db.add(
             OrderLine(
@@ -250,6 +298,7 @@ def create_pos_sale(
                 # Phase 22: snapshot the RATE, not just the resulting
                 # amount — see the field's docstring in app/domain/orders.py.
                 tax_rate_basis_points=tax.rate_basis_points if tax else 0,
+                discount_minor=line_discount_applied,
                 line_total_minor=line_total,
             )
         )
@@ -266,11 +315,12 @@ def create_pos_sale(
         )
         subtotal_minor += line_sub
         tax_minor += line_tax
+        discount_minor_total += line_discount_applied
 
     total_minor = subtotal_minor + tax_minor
     order.subtotal_minor = subtotal_minor
     order.tax_minor = tax_minor
-    order.discount_minor = 0
+    order.discount_minor = discount_minor_total
     order.total_minor = total_minor
     order.status = OrderStatus.COMPLETED
 

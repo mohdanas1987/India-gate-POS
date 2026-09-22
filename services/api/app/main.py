@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
-from app.api.v1 import auth, health, website_orders, products, categories, cash, orders, sync, approvals, reports
+from app.api.v1 import auth, health, website_orders, products, categories, cash, orders, sync, approvals, reports, customers, held_carts
 
 settings = get_settings()
 
@@ -39,3 +39,5 @@ app.include_router(orders.router, prefix=settings.api_v1_prefix)
 app.include_router(sync.router, prefix=settings.api_v1_prefix)
 app.include_router(approvals.router, prefix=settings.api_v1_prefix)
 app.include_router(reports.router, prefix=settings.api_v1_prefix)
+app.include_router(customers.router, prefix=settings.api_v1_prefix)
+app.include_router(held_carts.router, prefix=settings.api_v1_prefix)

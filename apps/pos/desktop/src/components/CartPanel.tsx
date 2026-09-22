@@ -33,6 +33,9 @@ export interface CartLine {
   currency: string;
   isWeighted: boolean;
   taxRateBasisPoints: number | null;
+  // Phase 9B: a flat amount (minor units) taken off this line. See
+  // computeLineTotal in pricing.ts for how it's applied and clamped.
+  discountMinor: number;
 }
 
 interface CartPanelProps {
@@ -40,11 +43,14 @@ interface CartPanelProps {
   selectedLineId: string | null;
   onSelectLine: (lineId: string | null) => void;
   onChangeQuantity: (lineId: string, quantity: number) => void;
+  onChangeDiscount: (lineId: string, discountMinor: number) => void;
   onRemoveLine: (lineId: string) => void;
   onClearCart: () => void;
 }
 
-export function CartPanel({ lines, selectedLineId, onSelectLine, onChangeQuantity, onRemoveLine, onClearCart }: CartPanelProps) {
+export function CartPanel({
+  lines, selectedLineId, onSelectLine, onChangeQuantity, onChangeDiscount, onRemoveLine, onClearCart,
+}: CartPanelProps) {
   if (lines.length === 0) {
     return <p className="text-sm text-gray-400 py-4 text-center">Cart is empty — search or scan a product to begin.</p>;
   }
@@ -56,6 +62,7 @@ export function CartPanel({ lines, selectedLineId, onSelectLine, onChangeQuantit
           <th className="pb-1">Product</th>
           <th className="pb-1">Qty</th>
           <th className="pb-1 text-right">Price</th>
+          <th className="pb-1 text-right">Disc.</th>
           <th className="pb-1 text-right">Tax</th>
           <th className="pb-1 text-right">Line Total</th>
           <th className="pb-1" />
@@ -65,7 +72,8 @@ export function CartPanel({ lines, selectedLineId, onSelectLine, onChangeQuantit
         {lines.map((l) => {
           const { subtotalMinor, taxMinor, totalMinor } = computeLineTotal(
             { price_minor: l.unitPriceMinor, currency: l.currency, is_weighted: l.isWeighted, tax_rate_basis_points: l.taxRateBasisPoints },
-            l.quantity
+            l.quantity,
+            l.discountMinor
           );
           const isSelected = selectedLineId === l.lineId;
           return (
@@ -116,6 +124,21 @@ export function CartPanel({ lines, selectedLineId, onSelectLine, onChangeQuantit
                 )}
               </td>
               <td className="py-1 text-right">{formatMoney(subtotalMinor, l.currency)}</td>
+              <td className="py-1 text-right" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  aria-label={`Discount for ${l.name}`}
+                  data-testid={`discount-${l.lineId}`}
+                  className="w-14 border rounded px-1 text-right text-xs"
+                  value={(l.discountMinor / 100).toFixed(2)}
+                  onChange={(e) => {
+                    const parsed = Math.round(parseFloat(e.target.value || "0") * 100);
+                    onChangeDiscount(l.lineId, Number.isFinite(parsed) && parsed >= 0 ? parsed : 0);
+                  }}
+                />
+              </td>
               <td className="py-1 text-right text-gray-500">{formatMoney(taxMinor, l.currency)}</td>
               <td className="py-1 text-right font-medium">{formatMoney(totalMinor, l.currency)}</td>
               <td className="py-1 text-right">
@@ -138,7 +161,7 @@ export function CartPanel({ lines, selectedLineId, onSelectLine, onChangeQuantit
       </tbody>
       <tfoot>
         <tr>
-          <td colSpan={6} className="pt-2">
+          <td colSpan={7} className="pt-2">
             <button type="button" className="text-xs text-gray-500 underline" onClick={onClearCart}>
               Clear cart
             </button>

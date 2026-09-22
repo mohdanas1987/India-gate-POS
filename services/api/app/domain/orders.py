@@ -43,6 +43,11 @@ class Order(Base):
     store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"))
     register_id: Mapped[int | None] = mapped_column(ForeignKey("registers.id"), nullable=True)
     cashier_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    # Phase 9B: optional customer attachment (the `customers` table itself
+    # has existed since before this phase with zero live rows — see
+    # app/domain/customer.py's docstring — so this is the first thing that
+    # actually links a sale to one).
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), nullable=True)
 
     sales_channel: Mapped[SalesChannel] = mapped_column(Enum(SalesChannel), default=SalesChannel.POS)
     external_order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)  # website's own order number

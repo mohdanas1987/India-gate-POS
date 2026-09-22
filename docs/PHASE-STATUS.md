@@ -76,6 +76,38 @@ None specific to Phase 9A's own acceptance criteria. Everything the CTO plan lis
 
 ---
 
+## PHASE 9A — CORRECTION GATE (CTO review of `d6bad7c`)
+
+Fixed exactly the three findings from the CTO's conditional-pass review, nothing else: (1) cart lines are now identified by a minted `lineId`, not `productId` — two weighted lines of the same product no longer collide (`src/lib/cartLineId.ts`, `CartPanel.tsx`, `PosPage.tsx`); (2) offline catalog sync (`electron/main.ts`'s `catalog:sync`, `GET /api/v1/products`) now paginates with a `cursor` param instead of a hard `?limit=1000` cap, so the real ~6,843-product catalog can sync in full; (3) a new regression test proves two independently-weighted lines of the same product resist collapsing into one. **Evidence:** pytest 109→111 passing; `tsc`/`vite build` clean; a live pagination reproduction against a real Postgres+uvicorn instance; a dedicated live Playwright script proving cart-line independence; the pagination test was verified to actually catch the regression by temporarily reverting the fix and confirming it fails. Discounts, suspended carts, customers, and payment providers were explicitly NOT touched in this pass per the CTO's own instruction. **PASS.**
+
+---
+
+## PHASE 9B — Customer Attach, Line Discounts (with Approval), Suspended Carts
+
+### Implemented
+
+**Customer attach** — `GET/POST /api/v1/customers` (search by name/phone/email, create), gated on a new `customers.manage` permission; `CustomerPicker.tsx` wires search-or-create into the cart, and `orders.customer_id` records who a sale was for.
+
+**Line-level discounts** — `compute_line_total` (checkout.py) and `computeLineTotal` (pricing.ts) both take a `discount_minor`, clamp it so it can never exceed the line's own subtotal, and compute tax on the discounted base (correct VAT treatment). Cart-level discounts are explicitly out of scope this pass (proportional per-VAT-rate allocation interacts with the Phase 22 X/Z report in a way not safe to rush).
+
+**Discount approval gate** — mirrors the existing refund-approval pattern but runs pre-checkout (`app/services/discounts.py`): a holder of `orders.discount.override` (Store Manager) applies a discount synchronously; a `orders.discount.apply`-only holder (Cashier) over the configured threshold gets a real `Approval` row a manager resolves via the existing `/api/v1/approvals` endpoints, which then completes the sale for the first time on approval. No `ApprovalPolicy` row is seeded for `orders.discount`, so the default is fail-safe: every discount requires approval until a threshold is configured.
+
+**Suspended/held carts** — `POST /api/v1/carts/hold`, `GET /api/v1/carts/held`, `POST /api/v1/carts/held/{id}/recall`. A held cart is a one-shot JSON snapshot (`{product_id, quantity, discount_minor}`); recall deletes the row atomically so the same held cart can't be rung up twice on two terminals. `F3`/`F4` are wired in `PosPage.tsx`; recall re-resolves each line's product via a new `GET /api/v1/products/{id}` since the snapshot doesn't carry full product detail.
+
+### Manual verification (live, not code-reading)
+
+Cold-boot: dropped/recreated `igpos_dev`, ran `alembic upgrade head` (chain `4f2b5a6b27f4 → 8a1c3f2e9b4d → 9c2e7d4a1b3f` applies cleanly from empty), reseeded, ran real `uvicorn`. Live `curl` sequence: customer create/search; a cashier's discount blocked with a structured 403 (`approval_id`); a manager listing and approving that request, which created the order server-side with hand-verified totals (2×€5.00 − €0.50 discount = €9.50 subtotal, €2.00 tax at 21%, €11.50 total); a manager applying a discount directly via `orders.discount.override` (synchronous, no approval row); a full hold → list → recall → list-again(empty) cycle. Backend: 128/128 pytest passing (pre-existing, unrelated `test_mock_website_provider.py` collection failure — missing `integrations` module — confirmed present before this pass too, via `git stash`, and excluded). Frontend: `tsc` (renderer + Electron main) and `vite build` both clean; the existing `smoke-test.mjs` re-run and still passes end-to-end (no regression); a new `smoke-test-9b.mjs` proves, in a real headless browser against the real API, that customer search-or-create round-trips, a line discount blocks checkout with a distinct "needs manager approval" message (not a generic error) while leaving the cart intact, and Hold/Recall correctly clears and repopulates the cart from the server.
+
+### Known limitations
+
+Offline discount/hold/recall/customer are not built — consistent with this project's "smallest correct change, disclose the rest" discipline. A discount beyond the approval threshold is explicitly unsupported offline (no live manager to approve it while disconnected); `PosPage.tsx`'s checkout guards this directly rather than silently dropping the discount or charging the undiscounted price. Cart-level (as opposed to line-level) discounts remain unbuilt, disclosed above.
+
+### CTO recommendation
+
+**PASS, pending review.** Backend and frontend both independently live-verified against a real database, a real running API, and a real browser — no claim here rests on code-reading alone.
+
+---
+
 ## Phase 22 — LedgerBrug (Bookkeeping/Tax) Integration Readiness — **CONDITIONAL PASS (4 of 5 buildable items shipped)**
 
 LedgerBrug's dev team sent 6 technical questions about POS capabilities needed to feed their system in real time. This phase started as a gap analysis (question classified BUILT / POS BUILD / LEDGERBRUG SIDE) and this pass closed every POS-side gap that didn't depend on LedgerBrug's still-missing contract document.

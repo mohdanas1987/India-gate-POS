@@ -32,21 +32,34 @@ export interface PricedProduct {
 
 export interface LineTotal {
   subtotalMinor: number;
+  discountAppliedMinor: number;
   taxMinor: number;
   totalMinor: number;
 }
 
-export function computeLineTotal(product: PricedProduct, quantity: number): LineTotal {
+/**
+ * Phase 9B: `discountMinor` mirrors compute_line_total's own convention
+ * server-side (checkout.py) — a flat amount knocked off THIS line's
+ * subtotal before tax is computed on the discounted base, clamped so a
+ * discount larger than the line can never produce a negative subtotal.
+ * This is still display-only (see the module docstring above) — the
+ * backend is what actually decides whether a given discount is even
+ * ALLOWED (permission + threshold + approval), this just renders what
+ * the cashier is about to ask for.
+ */
+export function computeLineTotal(product: PricedProduct, quantity: number, discountMinor = 0): LineTotal {
   if (quantity <= 0) {
-    return { subtotalMinor: 0, taxMinor: 0, totalMinor: 0 };
+    return { subtotalMinor: 0, discountAppliedMinor: 0, taxMinor: 0, totalMinor: 0 };
   }
-  const subtotalMinor = product.is_weighted
+  const rawSubtotalMinor = product.is_weighted
     ? Math.round((product.price_minor * quantity) / GRAMS_PER_KILO)
     : product.price_minor * quantity;
+  const discountAppliedMinor = Math.max(0, Math.min(discountMinor, rawSubtotalMinor));
+  const subtotalMinor = rawSubtotalMinor - discountAppliedMinor;
   const taxMinor = product.tax_rate_basis_points
     ? Math.round((subtotalMinor * product.tax_rate_basis_points) / 10000)
     : 0;
-  return { subtotalMinor, taxMinor, totalMinor: subtotalMinor + taxMinor };
+  return { subtotalMinor, discountAppliedMinor, taxMinor, totalMinor: subtotalMinor + taxMinor };
 }
 
 export function formatMoney(minor: number, currency = "EUR"): string {

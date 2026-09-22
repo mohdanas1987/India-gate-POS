@@ -287,7 +287,24 @@ def ingest_sync_event(
         lines_payload = body.payload.get("lines", [])
         if not lines_payload:
             raise CheckoutError("order.created event carried no cart lines")
+        # Phase 9B: discount/customer plumbing accepted here for contract
+        # consistency with the direct checkout route, but deliberately
+        # NOT run through the discount-approval gate (checkout_with_
+        # discount_check) — an offline device has no way to reach a
+        # manager for a live approval decision, and this event is
+        # processed asynchronously, possibly long after the cashier who
+        # rang it up has moved on. An offline discount beyond the
+        # threshold is therefore not yet supported (disclosed limitation,
+        # same shape as Phase 9E's still-open offline-authorization
+        # items); a within-threshold discount recorded here still needs
+        # no live approval, so it passes straight through like any other
+        # offline sale.
         payments_payload = body.payload.get("payments")
+        customer_id = body.payload.get("customer_id")
+        cart_lines = [
+            CartLineInput(int(l["product_id"]), int(l["quantity"]), int(l.get("discount_minor", 0)))
+            for l in lines_payload
+        ]
         if payments_payload:
             # Phase 22: an offline sale rung up with a split payment.
             order = create_pos_sale(
@@ -296,13 +313,14 @@ def ingest_sync_event(
                 store_id=principal.store_id,
                 register_id=int(body.payload["register_id"]),
                 cashier_user_id=principal.user_id,
-                lines=[CartLineInput(int(l["product_id"]), int(l["quantity"])) for l in lines_payload],
+                lines=cart_lines,
                 payments=[
                     PaymentInput(
                         PaymentMethod(p["method"]), int(p["amount_minor"]), p.get("provider_reference")
                     )
                     for p in payments_payload
                 ],
+                customer_id=customer_id,
             )
         else:
             order = create_pos_sale(
@@ -311,8 +329,9 @@ def ingest_sync_event(
                 store_id=principal.store_id,
                 register_id=int(body.payload["register_id"]),
                 cashier_user_id=principal.user_id,
-                lines=[CartLineInput(int(l["product_id"]), int(l["quantity"])) for l in lines_payload],
+                lines=cart_lines,
                 payment_method=PaymentMethod(body.payload.get("payment_method", "CASH")),
+                customer_id=customer_id,
             )
         # Phase 22: same atomic-with-the-order enqueue as the direct
         # checkout path (app/api/v1/orders.py).

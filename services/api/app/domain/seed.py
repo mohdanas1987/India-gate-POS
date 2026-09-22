@@ -16,6 +16,9 @@ DEFAULT_PERMISSIONS = [
     "orders.refund",
     "orders.refund.override",
     "orders.void",  # Phase 22 — same-day cashier void, distinct from refund
+    "orders.discount.apply",  # Phase 9B — apply a discount up to the configured threshold
+    "orders.discount.override",  # Phase 9B — apply/approve a discount beyond the threshold
+    "customers.manage",  # Phase 9B — create/search customers at the POS
     "products.create",
     "products.update",
     "products.delete",
@@ -38,6 +41,9 @@ DEFAULT_ROLE_PERMISSIONS = {
         "orders.refund",
         "orders.refund.override",
         "orders.void",
+        "orders.discount.apply",
+        "orders.discount.override",
+        "customers.manage",
         "products.create",
         "products.update",
         "website_orders.view",
@@ -47,7 +53,10 @@ DEFAULT_ROLE_PERMISSIONS = {
         "reports.day_close.finalize",
         "cash.manage_session",
     ],
-    "Cashier": ["orders.create", "orders.void", "website_orders.view", "cash.manage_session"],
+    "Cashier": [
+        "orders.create", "orders.void", "orders.discount.apply", "customers.manage",
+        "website_orders.view", "cash.manage_session",
+    ],
     "Inventory Manager": ["products.create", "products.update", "reports.view"],
     "Website Manager": ["website_orders.view", "website_orders.change_status", "sync.manage"],
 }

@@ -37,7 +37,7 @@ def store_setup(db):
 def test_compute_line_total_applies_tax_correctly(store_setup):
     product = store_setup["product"]
     tax = store_setup["tax"]
-    subtotal, tax_amt, total = compute_line_total(product, tax, quantity=2)
+    subtotal, discount_applied, tax_amt, total = compute_line_total(product, tax, quantity=2)
     assert subtotal == 2598  # 2 x 1299
     assert tax_amt == round(2598 * 0.21)
     assert total == subtotal + tax_amt
@@ -58,7 +58,7 @@ def test_compute_line_total_for_a_weighted_product_prices_by_grams_not_by_whole_
     db.add(weighted_product)
     db.flush()
 
-    subtotal, tax_amt, total = compute_line_total(weighted_product, tax, quantity=250)  # 250 grams
+    subtotal, discount_applied, tax_amt, total = compute_line_total(weighted_product, tax, quantity=250)  # 250 grams
     assert subtotal == 100  # 0.25 kg x 4.00 EUR/kg = 1.00 EUR = 100 minor units
     assert tax_amt == round(100 * 0.21)
     assert total == subtotal + tax_amt
@@ -77,7 +77,7 @@ def test_compute_line_total_weighted_rounds_to_the_nearest_minor_unit(db, store_
     db.add(weighted_product)
     db.flush()
 
-    subtotal, _, _ = compute_line_total(weighted_product, tax, quantity=333)
+    subtotal, _, _, _ = compute_line_total(weighted_product, tax, quantity=333)
     assert subtotal == 111
 
 

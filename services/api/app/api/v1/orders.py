@@ -11,6 +11,7 @@ from app.core.security import Principal
 from app.db.session import get_db
 from app.domain.orders import Order, PaymentMethod
 from app.services.checkout import CartLineInput, CheckoutError, PaymentInput, UnauthorizedResourceError, create_pos_sale
+from app.services.discounts import DiscountApprovalError, DiscountRequiresApprovalError, checkout_with_discount_check
 from app.services.ledgerbrug import enqueue_order_event
 from app.services.refunds import RefundError, RefundRequiresApprovalError, process_refund
 from app.services.voids import VoidError, VoidNotPermittedError, void_order
@@ -21,6 +22,10 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 class CartLineIn(BaseModel):
     product_id: int
     quantity: int
+    # Phase 9B: a flat per-line discount in minor units. Defaults to 0 so
+    # every pre-9B client (and every existing test) keeps sending carts
+    # with no discount field at all and nothing changes for them.
+    discount_minor: int = 0
 
 
 class PaymentIn(BaseModel):
@@ -44,6 +49,9 @@ class CreateOrderRequest(BaseModel):
     # `payment_method` is ignored.
     payment_method: PaymentMethod = PaymentMethod.CASH
     payments: list[PaymentIn] | None = None
+    # Phase 9B
+    customer_id: int | None = None
+    manager_override: bool = False
 
 
 class OrderOut(BaseModel):
@@ -55,6 +63,7 @@ class OrderOut(BaseModel):
     discount_minor: int
     total_minor: int
     currency: str
+    customer_id: int | None = None
 
     class Config:
         from_attributes = True
@@ -75,26 +84,39 @@ def create_order(
             status.HTTP_400_BAD_REQUEST,
             detail="This user has no store assigned — cannot ring up a sale without a store context",
         )
+    lines = [CartLineInput(l.product_id, l.quantity, l.discount_minor) for l in body.lines]
     try:
+        # Phase 9B: EVERY checkout now goes through the discount gate, not
+        # just discounted ones — a cart with zero discount on every line
+        # falls straight through to create_pos_sale() with no extra
+        # overhead (see checkout_with_discount_check's own docstring),
+        # so this is not a behavior change for the common no-discount
+        # case, only a new path for the discounted one.
         if body.payments is not None:
-            order = create_pos_sale(
+            order = checkout_with_discount_check(
                 db,
                 tenant_id=principal.tenant_id,
                 store_id=principal.store_id,
                 register_id=body.register_id,
                 cashier_user_id=principal.user_id,
-                lines=[CartLineInput(l.product_id, l.quantity) for l in body.lines],
+                principal=principal,
+                lines=lines,
                 payments=[PaymentInput(p.method, p.amount_minor, p.provider_reference) for p in body.payments],
+                customer_id=body.customer_id,
+                manager_override_requested=body.manager_override,
             )
         else:
-            order = create_pos_sale(
+            order = checkout_with_discount_check(
                 db,
                 tenant_id=principal.tenant_id,
                 store_id=principal.store_id,
                 register_id=body.register_id,
                 cashier_user_id=principal.user_id,
-                lines=[CartLineInput(l.product_id, l.quantity) for l in body.lines],
+                principal=principal,
+                lines=lines,
                 payment_method=body.payment_method,
+                customer_id=body.customer_id,
+                manager_override_requested=body.manager_override,
             )
         # Phase 22: queue the LedgerBrug event in the SAME transaction as
         # the order, so it is never possible for one to be committed
@@ -106,6 +128,20 @@ def create_order(
         db.commit()
         db.refresh(order)
     except UnauthorizedResourceError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except DiscountRequiresApprovalError as exc:
+        db.commit()  # persist the Approval row created before this was raised
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": str(exc),
+                "action_code": "orders.discount",
+                "threshold_minor_units": exc.threshold_minor_units,
+                "approval_id": exc.approval_id,
+            },
+        ) from exc
+    except DiscountApprovalError as exc:
         db.rollback()
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except CheckoutError as exc:
