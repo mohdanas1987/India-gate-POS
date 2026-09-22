@@ -133,6 +133,7 @@ def checkout_with_discount_check(
     if needs_approval and not effective_override and not self_authorized:
         approval = Approval(
             tenant_id=tenant_id,
+            store_id=store_id,
             action_code="orders.discount",
             requested_by_user_id=principal.user_id,
             status="REQUESTED",
@@ -188,6 +189,20 @@ def resolve_discount_approval(
         raise DiscountApprovalError(f"Approval {approval_id} is already {approval.status}, not REQUESTED")
     if not principal_has_permission(db, resolver, "orders.discount.override"):
         raise DiscountApprovalError("Resolving a discount approval requires the orders.discount.override permission")
+    # Phase 9B correction gate (CTO review of 96f6aa9, security issue #2):
+    # re-derived independently of the route's own check (same "route +
+    # domain layer both check" discipline the rest of this file already
+    # follows for the override permission itself) — a store-scoped
+    # resolver cannot resolve another store's discount approval.
+    if (
+        approval.store_id is not None
+        and resolver.store_id is not None
+        and approval.store_id != resolver.store_id
+        and not principal_has_permission(db, resolver, "approvals.manage.all_stores")
+    ):
+        raise DiscountApprovalError(
+            f"Approval {approval_id} belongs to a different store than the resolver is authorized for"
+        )
 
     if not approve:
         approval.status = "REJECTED"

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from app.domain.catalog import Product
+from app.domain.customer import Customer
 from app.domain.tenancy import Register, Store
 
 
@@ -57,3 +59,33 @@ def resolve_authorized_register(db: Session, tenant_id: int, store_id: int, regi
         )
 
     return register
+
+
+def resolve_authorized_product(db: Session, tenant_id: int, product_id: int) -> Product:
+    """
+    Phase 9B correction gate (CTO review of 96f6aa9, security issue #1):
+    the held-cart HOLD endpoint accepted a bare product_id inside its JSON
+    lines payload and stored it without ever checking it belongs to the
+    caller's own tenant — a cross-tenant (or deleted/soft-deleted) product
+    id could sit inside persistent operational state even though the
+    eventual checkout would still independently reject it. Every place
+    that accepts a product_id from an untrusted request body and is about
+    to PERSIST it (not just read it back through an already-tenant-scoped
+    query) must resolve it through here first, same discipline as
+    resolve_authorized_register above.
+    """
+    product = db.get(Product, product_id)
+    if product is None or product.tenant_id != tenant_id or product.is_deleted:
+        raise AuthorizationError(f"Product {product_id} does not exist for this tenant")
+    if not product.pos_visible:
+        raise AuthorizationError(f"Product {product_id} is not visible at the POS")
+    return product
+
+
+def resolve_authorized_customer(db: Session, tenant_id: int, customer_id: int) -> Customer:
+    """Same reasoning as resolve_authorized_product, for a customer_id
+    accepted from an untrusted request body before it's persisted."""
+    customer = db.get(Customer, customer_id)
+    if customer is None or customer.tenant_id != tenant_id:
+        raise AuthorizationError(f"Customer {customer_id} does not exist for this tenant")
+    return customer

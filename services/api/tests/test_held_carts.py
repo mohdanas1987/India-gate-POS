@@ -11,9 +11,10 @@ from app.api.v1.held_carts import HeldCartLineIn, HoldCartRequest, hold_cart, li
 from app.core.security import Principal
 from app.domain.authz import User
 from app.domain.catalog import Category, Product
+from app.domain.customer import Customer
 from app.domain.held_cart import HeldCart
 from app.domain.seed import seed_all
-from app.domain.tenancy import Register, Store
+from app.domain.tenancy import Register, Store, Tenant
 
 
 @pytest.fixture
@@ -112,3 +113,103 @@ def test_a_store_scoped_principal_from_another_store_cannot_see_or_recall_it(db,
     with pytest.raises(HTTPException) as exc_info:
         recall_held_cart(held.id, db=db, principal=other_principal)
     assert exc_info.value.status_code == 404
+
+
+# --- Phase 9B correction gate (CTO review of 96f6aa9, security issue #1):
+# hold_cart must prove every id it's about to persist belongs to the
+# caller's own tenant, not just the register. ---
+
+
+def test_holding_a_cart_with_another_tenants_product_is_rejected(db, held_cart_setup):
+    other_tenant = Tenant(name="A Rival Grocer")
+    db.add(other_tenant)
+    db.flush()
+    other_category = Category(tenant_id=other_tenant.id, name="Other", slug="other", sync_to_website=False)
+    db.add(other_category)
+    db.flush()
+    foreign_product = Product(tenant_id=other_tenant.id, category_id=other_category.id, name="Foreign Rice", price_minor=500, currency="EUR")
+    db.add(foreign_product)
+    db.flush()
+    db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        hold_cart(
+            HoldCartRequest(
+                register_id=held_cart_setup["register_id"],
+                lines=[HeldCartLineIn(product_id=foreign_product.id, quantity=1)],
+            ),
+            db=db, principal=held_cart_setup["principal"],
+        )
+    assert exc_info.value.status_code == 403
+    assert db.query(HeldCart).count() == 0  # rejected before anything was written
+
+
+def test_holding_a_cart_with_another_tenants_customer_is_rejected(db, held_cart_setup):
+    other_tenant = Tenant(name="A Rival Grocer")
+    db.add(other_tenant)
+    db.flush()
+    foreign_customer = Customer(tenant_id=other_tenant.id, name="Not Our Customer")
+    db.add(foreign_customer)
+    db.flush()
+    db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        hold_cart(
+            HoldCartRequest(
+                register_id=held_cart_setup["register_id"], customer_id=foreign_customer.id,
+                lines=[HeldCartLineIn(product_id=held_cart_setup["product"].id, quantity=1)],
+            ),
+            db=db, principal=held_cart_setup["principal"],
+        )
+    assert exc_info.value.status_code == 403
+    assert db.query(HeldCart).count() == 0
+
+
+def test_holding_a_cart_with_a_nonexistent_product_id_is_rejected(db, held_cart_setup):
+    with pytest.raises(HTTPException) as exc_info:
+        hold_cart(
+            HoldCartRequest(
+                register_id=held_cart_setup["register_id"],
+                lines=[HeldCartLineIn(product_id=999999, quantity=1)],
+            ),
+            db=db, principal=held_cart_setup["principal"],
+        )
+    assert exc_info.value.status_code == 403
+
+
+def test_holding_a_cart_with_a_soft_deleted_product_is_rejected(db, held_cart_setup):
+    held_cart_setup["product"].is_deleted = True
+    db.commit()
+    with pytest.raises(HTTPException) as exc_info:
+        hold_cart(
+            HoldCartRequest(
+                register_id=held_cart_setup["register_id"],
+                lines=[HeldCartLineIn(product_id=held_cart_setup["product"].id, quantity=1)],
+            ),
+            db=db, principal=held_cart_setup["principal"],
+        )
+    assert exc_info.value.status_code == 403
+
+
+def test_holding_a_cart_with_a_non_positive_quantity_is_rejected(db, held_cart_setup):
+    with pytest.raises(HTTPException) as exc_info:
+        hold_cart(
+            HoldCartRequest(
+                register_id=held_cart_setup["register_id"],
+                lines=[HeldCartLineIn(product_id=held_cart_setup["product"].id, quantity=0)],
+            ),
+            db=db, principal=held_cart_setup["principal"],
+        )
+    assert exc_info.value.status_code == 403
+
+
+def test_holding_a_cart_with_a_negative_discount_is_rejected(db, held_cart_setup):
+    with pytest.raises(HTTPException) as exc_info:
+        hold_cart(
+            HoldCartRequest(
+                register_id=held_cart_setup["register_id"],
+                lines=[HeldCartLineIn(product_id=held_cart_setup["product"].id, quantity=1, discount_minor=-50)],
+            ),
+            db=db, principal=held_cart_setup["principal"],
+        )
+    assert exc_info.value.status_code == 403

@@ -81,6 +81,17 @@ class ApprovalPolicy(Base):
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"))
     action_code: Mapped[str] = mapped_column(String(100))  # e.g. "orders.refund"
     threshold_minor_units: Mapped[int | None] = mapped_column(nullable=True)
+    # Phase 9B correction gate (CTO review of 96f6aa9, P1 finding #8):
+    # INFORMATIONAL ONLY — a human-readable label for admin UIs ("Store
+    # Manager and above"), never consulted by refunds.py/discounts.py to
+    # decide who can act. The actual authority is always a Permission
+    # (orders.refund.override / orders.discount.override), checked via
+    # principal_has_permission — a role name here can drift out of sync
+    # with which permissions a role actually holds (roles are
+    # admin-editable; see seed.py), so it must never become a second,
+    # competing source of truth for authorization. Kept as a column
+    # rather than dropped because Phase 14 (admin) will want it to render
+    # a human label without joining through role_permissions.
     required_role: Mapped[str] = mapped_column(String(100))
 
 
@@ -89,6 +100,13 @@ class Approval(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"))
+    # Phase 9B correction gate (CTO review of 96f6aa9, security issue #2):
+    # which store this approval belongs to, so a store-scoped manager
+    # can't see or resolve another store's pending approval just because
+    # they share a tenant. Nullable only for data that predates this
+    # column (see the migration's backfill) — every approval CREATED from
+    # here on always sets it.
+    store_id: Mapped[int | None] = mapped_column(ForeignKey("stores.id"), nullable=True)
     action_code: Mapped[str] = mapped_column(String(100))
     requested_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     approved_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)

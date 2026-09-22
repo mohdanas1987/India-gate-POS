@@ -108,6 +108,26 @@ Offline discount/hold/recall/customer are not built — consistent with this pro
 
 ---
 
+## PHASE 9B — CORRECTION GATE (CTO review of `96f6aa9`, CONDITIONAL PASS)
+
+The CTO's review found the Phase 9B implementation fundamentally sound but flagged two P0 security gaps and a P1 list. Both P0s are fixed here; nothing else from 9B was touched.
+
+**P0 #1 — held-cart contents were never validated against the caller's own tenant.** `POST /api/v1/carts/hold` accepted a bare `product_id`/`customer_id` inside its JSON body and persisted it without checking either belongs to the caller's tenant, or that quantity/discount are sane. Fixed by two new centralized validators alongside the existing `resolve_authorized_register` (`app/services/authorization.py`): `resolve_authorized_product` (tenant match, not soft-deleted, POS-visible) and `resolve_authorized_customer` (tenant match), both called from `hold_cart` before anything is written, plus explicit `quantity > 0` / `discount_minor >= 0` checks per line. A bad id or value now rejects the whole hold with 403 rather than silently storing it.
+
+**P0 #2 — the discount/refund approval workflow was not store-scoped.** `Approval` had no `store_id`, so any Store Manager in the tenant could list and resolve another store's pending approval (both refund and discount approvals share this table/route). Fixed with a new migration (`2d8f4c6a19e7`) adding `Approval.store_id` (backfilled from each row's own context/order), populated at creation time in both `discounts.py` and `refunds.py`, and enforced in two places per this codebase's own "route + domain layer both check" convention: `app/api/v1/approvals.py` filters the list and blocks cross-store resolution with 404 (not 403, so a manager can't even confirm another store's approval exists), and `resolve_discount_approval`/`resolve_approval` independently re-derive the same check. A new `approvals.manage.all_stores` permission (Owner/Administrator by default, not Store Manager) is the deliberate org-wide escape hatch the CTO asked for.
+
+**P1s addressed:** `ApprovalPolicy.required_role` is now documented in-code as informational-only (never consulted for authorization — `orders.discount.override`/`orders.refund.override` permissions are the actual authority), not removed, since Phase 14 admin UI will want the human-readable label. New regression tests: a Store-A manager cannot resolve a Store-B discount or refund approval (and the correct store's manager still can); an org-wide approver can resolve any store's; a held cart cannot contain another tenant's product or customer, a nonexistent product id, a non-positive quantity, or a negative discount; a soft-deleted product is rejected. Offline 9B remains explicitly deferred, unchanged.
+
+### Manual verification (live, not code-reading)
+
+Cold-boot: dropped/recreated `igpos_dev`, ran `alembic upgrade head` (chain now `... → 9c2e7d4a1b3f → 2d8f4c6a19e7`), confirmed `alembic downgrade -1` then `upgrade head` round-trips cleanly. 137/137 pytest passing (9 new: 6 held-cart validation, 2 discount store-scope, 1 refund store-scope). Live `curl` reproduction with two stores and two store-scoped managers: Manager 2 (Store 2) lists `[]` and gets 404 resolving Store 1's discount approval; Manager 1 (Store 1) sees and correctly approves it; the Owner (org-wide) also sees it. Held-cart hold rejected live with 403 for a nonexistent product id, a zero quantity, and a negative discount, then a valid hold succeeded (201). Both existing Playwright scripts (`smoke-test.mjs`, `smoke-test-9b.mjs`) re-run against the corrected backend and still pass end-to-end with no regression.
+
+### CTO recommendation
+
+**PASS.** Both P0s fixed and live-verified with a genuine multi-store reproduction, not inferred from the unit tests alone.
+
+---
+
 ## Phase 22 — LedgerBrug (Bookkeeping/Tax) Integration Readiness — **CONDITIONAL PASS (4 of 5 buildable items shipped)**
 
 LedgerBrug's dev team sent 6 technical questions about POS capabilities needed to feed their system in real time. This phase started as a gap analysis (question classified BUILT / POS BUILD / LEDGERBRUG SIDE) and this pass closed every POS-side gap that didn't depend on LedgerBrug's still-missing contract document.

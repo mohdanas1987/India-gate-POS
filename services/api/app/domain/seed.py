@@ -19,6 +19,7 @@ DEFAULT_PERMISSIONS = [
     "orders.discount.apply",  # Phase 9B — apply a discount up to the configured threshold
     "orders.discount.override",  # Phase 9B — apply/approve a discount beyond the threshold
     "customers.manage",  # Phase 9B — create/search customers at the POS
+    "approvals.manage.all_stores",  # Phase 9B correction gate — see/resolve approvals across stores, not just your own
     "products.create",
     "products.update",
     "products.delete",

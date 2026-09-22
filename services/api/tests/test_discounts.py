@@ -217,3 +217,80 @@ def test_discount_larger_than_the_line_clamps_to_zero_not_negative(db, discount_
     assert order.subtotal_minor == 0
     assert order.tax_minor == 0
     assert order.discount_minor == 1000  # clamped to the line's own subtotal, not the requested 999999
+
+
+def test_a_manager_from_another_store_cannot_resolve_this_approval(db, discount_setup):
+    """Phase 9B correction gate (CTO review of 96f6aa9, security issue
+    #2): the approval carries the STORE it was requested from, and a
+    store-scoped manager elsewhere in the same tenant cannot resolve it
+    — same isolation test_held_carts.py already proves for held carts."""
+    db.add(ApprovalPolicy(tenant_id=discount_setup["tenant_id"], action_code="orders.discount", threshold_minor_units=50, required_role="Store Manager"))
+    db.commit()
+    with pytest.raises(DiscountRequiresApprovalError) as exc_info:
+        checkout_with_discount_check(
+            db, tenant_id=discount_setup["tenant_id"], store_id=discount_setup["store_id"],
+            register_id=discount_setup["register_id"], cashier_user_id=discount_setup["cashier_id"],
+            principal=discount_setup["cashier_principal"],
+            lines=[CartLineInput(discount_setup["product"].id, 2, discount_minor=100)],
+            payment_method=PaymentMethod.CASH,
+        )
+    approval_id = exc_info.value.approval_id
+
+    other_store = Store(tenant_id=discount_setup["tenant_id"], name="Other Store")
+    db.add(other_store)
+    db.flush()
+    other_manager = User(tenant_id=discount_setup["tenant_id"], name="Other Store Manager", email="other-store-manager@test-fixture.local", password_hash="x")
+    db.add(other_manager)
+    db.flush()
+    db.commit()
+    other_store_manager_principal = Principal(user_id=other_manager.id, tenant_id=discount_setup["tenant_id"], role="Store Manager", store_id=other_store.id)
+
+    with pytest.raises(DiscountApprovalError):
+        resolve_discount_approval(
+            db, tenant_id=discount_setup["tenant_id"], approval_id=approval_id,
+            resolver=other_store_manager_principal, approve=True,
+        )
+    # Nothing changed — still pending for the correct store's manager.
+    approval = db.get(Approval, approval_id)
+    assert approval.status == "REQUESTED"
+
+    # And the SAME store's manager can still resolve it normally.
+    approval, order = resolve_discount_approval(
+        db, tenant_id=discount_setup["tenant_id"], approval_id=approval_id,
+        resolver=discount_setup["manager_principal"], approve=True,
+    )
+    assert approval.status == "APPROVED"
+    assert order is not None
+
+
+def test_an_org_wide_approver_can_resolve_another_stores_discount(db, discount_setup):
+    """An Owner/Administrator (holds approvals.manage.all_stores) is the
+    deliberate escape hatch — store scope restricts ordinary Store
+    Managers, not the org-wide role."""
+    db.add(ApprovalPolicy(tenant_id=discount_setup["tenant_id"], action_code="orders.discount", threshold_minor_units=50, required_role="Store Manager"))
+    db.commit()
+    with pytest.raises(DiscountRequiresApprovalError) as exc_info:
+        checkout_with_discount_check(
+            db, tenant_id=discount_setup["tenant_id"], store_id=discount_setup["store_id"],
+            register_id=discount_setup["register_id"], cashier_user_id=discount_setup["cashier_id"],
+            principal=discount_setup["cashier_principal"],
+            lines=[CartLineInput(discount_setup["product"].id, 2, discount_minor=100)],
+            payment_method=PaymentMethod.CASH,
+        )
+    approval_id = exc_info.value.approval_id
+
+    other_store = Store(tenant_id=discount_setup["tenant_id"], name="Other Store")
+    db.add(other_store)
+    db.flush()
+    owner_user = User(tenant_id=discount_setup["tenant_id"], name="Org Owner", email="org-owner@test-fixture.local", password_hash="x")
+    db.add(owner_user)
+    db.flush()
+    db.commit()
+    owner_principal = Principal(user_id=owner_user.id, tenant_id=discount_setup["tenant_id"], role="Owner", store_id=other_store.id)
+
+    approval, order = resolve_discount_approval(
+        db, tenant_id=discount_setup["tenant_id"], approval_id=approval_id,
+        resolver=owner_principal, approve=True,
+    )
+    assert approval.status == "APPROVED"
+    assert order is not None

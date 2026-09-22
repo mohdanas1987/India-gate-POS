@@ -17,7 +17,12 @@ from app.core.rbac import require_permission
 from app.core.security import Principal
 from app.db.session import get_db
 from app.domain.held_cart import HeldCart
-from app.services.authorization import AuthorizationError, resolve_authorized_register
+from app.services.authorization import (
+    AuthorizationError,
+    resolve_authorized_customer,
+    resolve_authorized_product,
+    resolve_authorized_register,
+)
 
 router = APIRouter(prefix="/carts", tags=["carts"])
 
@@ -62,8 +67,25 @@ def hold_cart(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="This user has no store assigned — cannot hold a cart")
     if not body.lines:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Cannot hold an empty cart")
+
+    # Phase 9B correction gate (CTO review of 96f6aa9, security issue #1):
+    # a held cart is persistent operational state, not a transient
+    # request — every id inside it (register, each line's product,
+    # customer) must be proven to belong to THIS tenant/store before it's
+    # written, not just re-checked later at recall/checkout time. Reject
+    # the whole hold if any single id doesn't check out, rather than
+    # silently dropping the bad line — a cashier who fat-fingered or
+    # replayed a stale id needs to see that, not a partially-held cart.
     try:
         resolve_authorized_register(db, principal.tenant_id, principal.store_id, body.register_id)
+        if body.customer_id is not None:
+            resolve_authorized_customer(db, principal.tenant_id, body.customer_id)
+        for line in body.lines:
+            if line.quantity <= 0:
+                raise AuthorizationError(f"Line quantity must be positive, got {line.quantity}")
+            if line.discount_minor < 0:
+                raise AuthorizationError(f"Line discount cannot be negative, got {line.discount_minor}")
+            resolve_authorized_product(db, principal.tenant_id, line.product_id)
     except AuthorizationError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
 

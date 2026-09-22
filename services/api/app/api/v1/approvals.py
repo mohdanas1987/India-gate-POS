@@ -81,6 +81,18 @@ def list_approvals(
     query = db.query(Approval).filter(Approval.tenant_id == principal.tenant_id)
     if status_filter:
         query = query.filter(Approval.status == status_filter)
+
+    # Phase 9B correction gate (CTO review of 96f6aa9, security issue #2):
+    # a store-scoped manager only sees THIS store's approvals — plus any
+    # approval that predates the store_id column (NULL; see the
+    # migration's backfill note on why NULL defaults to visible, not
+    # hidden). Someone holding the org-wide "approvals.manage.all_stores"
+    # permission (Owner/Administrator by default) sees every store.
+    if principal.store_id is not None and not principal_has_permission(
+        db, principal, "approvals.manage.all_stores"
+    ):
+        query = query.filter((Approval.store_id == principal.store_id) | (Approval.store_id.is_(None)))
+
     return query.order_by(Approval.created_at.desc()).all()
 
 
@@ -104,6 +116,21 @@ def resolve_approval_route(
     """
     approval = db.get(Approval, approval_id)
     if not approval or approval.tenant_id != principal.tenant_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Approval {approval_id} not found")
+
+    # Phase 9B correction gate (CTO review of 96f6aa9, security issue #2):
+    # a store-scoped manager cannot resolve another store's approval just
+    # because it's the same tenant. Checked here (route layer, using the
+    # approval row's OWN store_id) as well as re-derived independently
+    # inside resolve_discount_approval/resolve_approval from the cart/
+    # order context — same "route + domain layer both check" discipline
+    # as every other authorization gate in this codebase.
+    if (
+        approval.store_id is not None
+        and principal.store_id is not None
+        and approval.store_id != principal.store_id
+        and not principal_has_permission(db, principal, "approvals.manage.all_stores")
+    ):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Approval {approval_id} not found")
 
     try:

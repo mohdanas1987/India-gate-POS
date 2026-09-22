@@ -227,3 +227,43 @@ def test_second_refund_can_still_use_up_the_remaining_balance(db, order_setup):
     )
     assert second.amount_minor == 400
     assert order.status.value == "REFUNDED"
+
+
+def test_a_manager_from_another_store_cannot_resolve_this_refund_approval(db, order_setup):
+    """Phase 9B correction gate (CTO review of 96f6aa9, security issue
+    #2): a refund approval now carries the order's own store_id, and a
+    store-scoped manager elsewhere in the tenant cannot resolve it —
+    mirrors the analogous discount test in test_discounts.py, since both
+    action codes now share this same store-scope check."""
+    with pytest.raises(RefundRequiresApprovalError) as exc_info:
+        process_refund(
+            db, tenant_id=order_setup["tenant_id"], order_id=order_setup["order"].id,
+            principal=order_setup["cashier_principal"], amount_minor=100, reason="test",
+        )
+    approval_id = exc_info.value.approval_id
+
+    other_store = Store(tenant_id=order_setup["tenant_id"], name="Other Store")
+    db.add(other_store)
+    db.flush()
+    other_manager = User(tenant_id=order_setup["tenant_id"], name="Other Store Manager", email="other-store-refund-manager@test-fixture.local", password_hash="x")
+    db.add(other_manager)
+    db.flush()
+    db.commit()
+    other_store_manager_principal = Principal(user_id=other_manager.id, tenant_id=order_setup["tenant_id"], role="Store Manager", store_id=other_store.id)
+
+    from app.services.refunds import ApprovalError
+
+    with pytest.raises(ApprovalError):
+        resolve_approval(
+            db, tenant_id=order_setup["tenant_id"], approval_id=approval_id,
+            resolver=other_store_manager_principal, approve=True,
+        )
+    approval = db.get(Approval, approval_id)
+    assert approval.status == "REQUESTED"
+
+    # The correct store's own manager can still resolve it normally.
+    approval = resolve_approval(
+        db, tenant_id=order_setup["tenant_id"], approval_id=approval_id,
+        resolver=order_setup["manager_principal"], approve=True,
+    )
+    assert approval.status == "APPROVED"

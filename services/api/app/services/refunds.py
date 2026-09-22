@@ -140,6 +140,7 @@ def process_refund(
     if needs_approval and not effective_override:
         approval = Approval(
             tenant_id=tenant_id,
+            store_id=order.store_id,
             action_code="orders.refund",
             requested_by_user_id=principal.user_id,
             status="REQUESTED",
@@ -222,6 +223,20 @@ def resolve_approval(
         raise ApprovalError(f"Approval {approval_id} is already {approval.status}, not REQUESTED")
     if not principal_has_permission(db, resolver, "orders.refund.override"):
         raise ApprovalError("Resolving a refund approval requires the orders.refund.override permission")
+    # Phase 9B correction gate (CTO review of 96f6aa9, security issue #2):
+    # same store-scope re-derivation as discounts.py's
+    # resolve_discount_approval — a store-scoped manager cannot resolve
+    # another store's refund approval either, now that both action codes
+    # share the same Approval table and this same gap.
+    if (
+        approval.store_id is not None
+        and resolver.store_id is not None
+        and approval.store_id != resolver.store_id
+        and not principal_has_permission(db, resolver, "approvals.manage.all_stores")
+    ):
+        raise ApprovalError(
+            f"Approval {approval_id} belongs to a different store than the resolver is authorized for"
+        )
 
     import datetime as dt
 
