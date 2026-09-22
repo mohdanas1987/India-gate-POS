@@ -1,34 +1,36 @@
 /**
- * Phase 9 — Main POS screen.
+ * Phase 9A — POS Transaction UX Foundation.
  *
- * Rebuilt during the CTO-audit remediation pass (commit c4bfb82 audit
- * findings #3/#5/#6/#8). Three real gaps are closed here, stated plainly:
+ * Rebuilt from the Phase 9 "prototype" screen (single-column, no category
+ * nav, +1-only cart, no weighted-product support, no keyboard nav — see
+ * the Phase 9A gap analysis in PHASE-STATUS.md for the full before/after)
+ * to meet the CTO plan's Phase 9A acceptance criteria: category
+ * navigation + real search (name/SKU/barcode), a proper cart (qty
+ * edit/remove/line-select/clear), weighted-product entry, and basic
+ * keyboard/scanner UX — all working identically online and offline.
  *
- * 1. There was no "open a cashier session" UI anywhere. Checkout only
- *    ever appeared to work in manual testing because a session had been
- *    opened once via a direct curl call against a persistent dev database
- *    and never closed — an undocumented, non-reproducible precondition.
- *    This screen now checks for an open session and prompts to open one
- *    if none exists, via the real `GET/POST /api/v1/cash/session`
- *    endpoints.
+ * Retains, unchanged, the two real fixes from the prior remediation pass:
+ * 1. Session-gating: checkout is blocked behind a real "Open Register"
+ *    screen backed by GET/POST /api/v1/cash/session (+ Phase 22.1's
+ *    offline shift-start fallback).
+ * 2. Environment split: inside Electron, search/checkout run entirely
+ *    against the local SQLite catalog/outbox (electron/offlineCheckout.ts)
+ *    with zero network calls; outside it (the Playwright smoke test's
+ *    plain-browser renderer), the original direct-HTTP path is used,
+ *    since window.electronAPI genuinely doesn't exist there.
  *
- * 2. Checkout was cloud-dependent: it called `fetch(.../api/v1/orders)`
- *    directly, so a lost connection meant a cashier could not complete a
- *    sale at all — directly contradicting the "checkout must work fully
- *    offline" requirement. Inside Electron, checkout and product search
- *    now go through window.electronAPI, which runs entirely against the
- *    local SQLite catalog/outbox in the main process
- *    (electron/offlineCheckout.ts) — zero network calls on the hot path.
- *
- * 3. Running outside Electron (this is how the Playwright smoke test
- *    exercises the renderer, via `vite preview` in a plain browser tab)
- *    keeps the original direct-HTTP path, since window.electronAPI
- *    genuinely doesn't exist there. Both paths are real, not one faked —
- *    see PHASE-STATUS.md for exactly what's been verified for each.
+ * SECURITY (CTO plan §37): every price/tax/total shown here
+ * (src/lib/pricing.ts) is a DISPLAY-ONLY preview. The backend
+ * independently recomputes and is the only source of the amount actually
+ * charged — see compute_line_total's docstring in checkout.py.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ConnectivityBadge } from "../components/ConnectivityBadge";
+import { CategorySidebar, CategoryDto } from "../components/CategorySidebar";
+import { CartPanel, CartLine } from "../components/CartPanel";
+import { WeightEntryDialog } from "../components/WeightEntryDialog";
+import { computeLineTotal, formatMoney } from "../lib/pricing";
 import { authedFetch, isElectron } from "../api/authedFetch";
 
 const DEFAULT_REGISTER_ID = 1; // single-register default until store/register selection UI exists (Phase 13/9)
@@ -39,13 +41,11 @@ interface ProductDto {
   sku: string | null;
   price_minor: number;
   currency: string;
-}
-
-interface CartLine {
-  productId: number;
-  name: string;
-  quantity: number;
-  unitPriceMinor: number;
+  unit: string;
+  is_weighted: boolean;
+  category_id: number | null;
+  tax_rate_basis_points: number | null;
+  barcodes: string[];
 }
 
 interface OrderDto {
@@ -60,9 +60,18 @@ interface OpenSessionDto {
   is_open: boolean;
 }
 
-async function searchProductsOnline(q: string): Promise<ProductDto[]> {
-  const result = await authedFetch<ProductDto[]>(`/api/v1/products?q=${encodeURIComponent(q)}`);
+async function searchProductsOnline(q: string, categoryId: number | null): Promise<ProductDto[]> {
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (categoryId !== null) params.set("category_id", String(categoryId));
+  const result = await authedFetch<ProductDto[]>(`/api/v1/products?${params.toString()}`);
   if (!result.ok) throw new Error(`Product search failed: HTTP ${result.status}`);
+  return result.body;
+}
+
+async function listCategoriesOnline(): Promise<CategoryDto[]> {
+  const result = await authedFetch<CategoryDto[]>("/api/v1/categories");
+  if (!result.ok) throw new Error(`Could not load categories: HTTP ${result.status}`);
   return result.body;
 }
 
@@ -121,7 +130,13 @@ async function triggerHardwareForCompletedSale(orderLabel: string, lines: CartLi
   try {
     await window.electronAPI.printReceipt({
       orderLabel: `India Gate POS — ${orderLabel}`,
-      lines: lines.map((l) => ({ name: l.name, quantity: l.quantity, lineTotalMinor: l.unitPriceMinor * l.quantity })),
+      lines: lines.map((l) => {
+        const { totalMinor: lineTotal } = computeLineTotal(
+          { price_minor: l.unitPriceMinor, currency: l.currency, is_weighted: l.isWeighted, tax_rate_basis_points: l.taxRateBasisPoints },
+          l.quantity
+        );
+        return { name: l.name, quantity: l.quantity, lineTotalMinor: lineTotal };
+      }),
       totalMinor,
     });
   } catch (err) {
@@ -131,13 +146,19 @@ async function triggerHardwareForCompletedSale(orderLabel: string, lines: CartLi
 
 export function PosPage() {
   const [search, setSearch] = useState("");
+  const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
   const [cart, setCart] = useState<CartLine[]>([]);
+  const [selectedLineId, setSelectedLineId] = useState<number | null>(null);
   const [lastReceipt, setLastReceipt] = useState<string | null>(null);
   const [sessionChecked, setSessionChecked] = useState(false);
   const [hasOpenSession, setHasOpenSession] = useState(false);
   const [openingCash, setOpeningCash] = useState("");
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [localProducts, setLocalProducts] = useState<ProductDto[]>([]);
+  const [localCategories, setLocalCategories] = useState<CategoryDto[]>([]);
+  const [weightDialogProduct, setWeightDialogProduct] = useState<ProductDto | null>(null);
+  const [focusedProductIndex, setFocusedProductIndex] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
 
   // On mount: figure out whether a session is already open, checking the
@@ -169,11 +190,26 @@ export function PosPage() {
     };
   }, []);
 
+  // Phase 9A: keyboard shortcut bar. F1 focuses search (the mockup's own
+  // "F1 Search" hotkey). F3 Hold / F4 Recall are shown, disabled, in the
+  // hotkey bar below — they belong to Phase 9B's suspended-cart feature
+  // and are deliberately NOT wired to fake functionality here.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "F1") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   async function handleOpenRegister(e: React.FormEvent) {
     e.preventDefault();
     setSessionError(null);
+    const amountMinor = Math.round(parseFloat(openingCash || "0") * 100);
     try {
-      const amountMinor = Math.round(parseFloat(openingCash || "0") * 100);
       const session = await openSessionOnline(amountMinor);
       if (isElectron()) {
         // Cache the opened session locally so checkout can validate it
@@ -200,35 +236,97 @@ export function PosPage() {
         await window.electronAPI!.syncCatalog().catch((err) => console.warn("Catalog sync failed:", err));
       }
       setHasOpenSession(true);
-    } catch (err) {
-      setSessionError((err as Error).message);
+    } catch (onlineErr) {
+      // Phase 22.1 (CTO gate: offline shift-start). The online attempt
+      // failed — could be no network, could be a genuine rejection
+      // (wrong register, no permission, etc). Only worth trying the
+      // offline path inside Electron; outside it there is no local
+      // device database to check against at all.
+      if (!isElectron()) {
+        setSessionError((onlineErr as Error).message);
+        return;
+      }
+      const offline = await window.electronAPI!.openShiftOffline(DEFAULT_REGISTER_ID, amountMinor);
+      if (offline.ok) {
+        setHasOpenSession(true);
+      } else {
+        // Report both: the online failure is often "network unreachable"
+        // (uninformative), while the offline failure explains exactly
+        // why offline couldn't take over either (e.g. "sign in online at
+        // least once first") — a cashier troubleshooting this needs the
+        // second message, not just the first.
+        setSessionError(`${(onlineErr as Error).message}. Offline fallback also failed: ${offline.error}`);
+      }
     }
   }
 
-  const { data: onlineProducts } = useQuery({
-    queryKey: ["products", search],
-    queryFn: () => searchProductsOnline(search),
-    enabled: search.length > 0 && !isElectron(),
+  // --- Categories (online query hook + offline effect, same split
+  // pattern the rest of this file already uses for products) ---
+
+  const { data: onlineCategories } = useQuery({
+    queryKey: ["categories"],
+    queryFn: listCategoriesOnline,
+    enabled: !isElectron() && hasOpenSession,
   });
 
   useEffect(() => {
-    if (!isElectron() || search.length === 0) {
+    if (!isElectron() || !hasOpenSession) return;
+    let cancelled = false;
+    window.electronAPI!.listLocalCategories().then((rows) => {
+      if (!cancelled) setLocalCategories(rows);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [hasOpenSession]);
+
+  const categories = isElectron() ? localCategories : onlineCategories ?? [];
+
+  // --- Products ---
+
+  const { data: onlineProducts } = useQuery({
+    queryKey: ["products", search, selectedCategoryId],
+    queryFn: () => searchProductsOnline(search, selectedCategoryId),
+    enabled: !isElectron() && hasOpenSession && (search.length > 0 || selectedCategoryId !== null),
+  });
+
+  useEffect(() => {
+    if (!isElectron() || !hasOpenSession) {
+      setLocalProducts([]);
+      return;
+    }
+    if (search.length === 0 && selectedCategoryId === null) {
       setLocalProducts([]);
       return;
     }
     let cancelled = false;
-    window.electronAPI!.searchLocalProducts(search).then((rows) => {
+    window.electronAPI!.searchLocalProducts(search || null, selectedCategoryId).then((rows) => {
       if (cancelled) return;
       setLocalProducts(
-        rows.map((r) => ({ id: r.id, name: r.name, sku: r.sku, price_minor: r.price_minor, currency: r.currency }))
+        rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          sku: r.sku,
+          price_minor: r.price_minor,
+          currency: r.currency,
+          unit: r.unit,
+          is_weighted: !!r.is_weighted,
+          category_id: r.category_id,
+          tax_rate_basis_points: r.tax_rate_basis_points,
+          barcodes: JSON.parse(r.barcodes || "[]") as string[],
+        }))
       );
     });
     return () => {
       cancelled = true;
     };
-  }, [search]);
+  }, [search, selectedCategoryId, hasOpenSession]);
 
   const products = isElectron() ? localProducts : onlineProducts ?? [];
+
+  useEffect(() => {
+    setFocusedProductIndex(0);
+  }, [products]);
 
   const checkoutMutation = useMutation({
     mutationFn: async () => {
@@ -245,23 +343,120 @@ export function PosPage() {
     onSuccess: ({ label, totalMinor }) => {
       const soldLines = cart;
       setCart([]);
-      setLastReceipt(`${label} — total €${(totalMinor / 100).toFixed(2)}`);
+      setSelectedLineId(null);
+      setLastReceipt(`${label} — total ${formatMoney(totalMinor)}`);
       queryClient.invalidateQueries({ queryKey: ["products"] });
       void triggerHardwareForCompletedSale(label, soldLines, totalMinor);
     },
   });
 
-  function addToCart(p: ProductDto) {
+  function addToCart(p: ProductDto, quantity = 1) {
     setCart((prev) => {
       const existing = prev.find((l) => l.productId === p.id);
-      if (existing) {
-        return prev.map((l) => (l.productId === p.id ? { ...l, quantity: l.quantity + 1 } : l));
+      if (existing && !p.is_weighted) {
+        // Weighted lines are never merged — each weigh-in is its own
+        // line (a cashier re-weighing the same product is a second sale
+        // of it, not automatically additive), matching how a real scale
+        // workflow behaves. Whole-unit products still merge quantities.
+        return prev.map((l) => (l.productId === p.id ? { ...l, quantity: l.quantity + quantity } : l));
       }
-      return [...prev, { productId: p.id, name: p.name, quantity: 1, unitPriceMinor: p.price_minor }];
+      return [
+        ...prev,
+        {
+          productId: p.id,
+          name: p.name,
+          quantity,
+          unitPriceMinor: p.price_minor,
+          currency: p.currency,
+          isWeighted: p.is_weighted,
+          taxRateBasisPoints: p.tax_rate_basis_points,
+        },
+      ];
     });
   }
 
-  const totalMinor = cart.reduce((sum, l) => sum + l.unitPriceMinor * l.quantity, 0);
+  function handleProductActivate(p: ProductDto) {
+    if (p.is_weighted) {
+      setWeightDialogProduct(p);
+    } else {
+      addToCart(p);
+    }
+  }
+
+  function changeCartQuantity(productId: number, quantity: number) {
+    setCart((prev) => {
+      if (quantity <= 0) return prev.filter((l) => l.productId !== productId);
+      return prev.map((l) => (l.productId === productId ? { ...l, quantity } : l));
+    });
+  }
+
+  function removeCartLine(productId: number) {
+    setCart((prev) => prev.filter((l) => l.productId !== productId));
+    setSelectedLineId((prev) => (prev === productId ? null : prev));
+  }
+
+  function clearCart() {
+    setCart([]);
+    setSelectedLineId(null);
+  }
+
+  // Phase 9A "scanner input" support: a barcode scanner is, functionally,
+  // a very fast keyboard typist that ends with Enter. Rather than build a
+  // timing-based heuristic (fragile, and untestable without real
+  // hardware — the CTO plan's own honesty rule against inventing
+  // unverifiable behavior applies here), this takes the simpler,
+  // deterministic approach: on Enter, if the current search text is an
+  // EXACT match against exactly one visible product's SKU or a barcode,
+  // that product is added immediately and the search clears — the same
+  // outcome a scanner-then-Enter produces, and it also works for a
+  // cashier who types a SKU by hand and presses Enter.
+  function handleSearchKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Escape") {
+      setSearch("");
+      return;
+    }
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setFocusedProductIndex((i) => Math.min(i + 1, Math.max(products.length - 1, 0)));
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setFocusedProductIndex((i) => Math.max(i - 1, 0));
+      return;
+    }
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const query = search.trim();
+    const exactMatches = query
+      ? products.filter((p) => p.sku === query || p.barcodes.includes(query))
+      : [];
+    if (exactMatches.length === 1) {
+      handleProductActivate(exactMatches[0]);
+      setSearch("");
+      return;
+    }
+    // No unique exact match — fall back to activating whichever product
+    // is currently keyboard-focused in the grid, if any.
+    const focused = products[focusedProductIndex];
+    if (focused) handleProductActivate(focused);
+  }
+
+  const totals = cart.reduce(
+    (acc, l) => {
+      const { subtotalMinor, taxMinor, totalMinor } = computeLineTotal(
+        { price_minor: l.unitPriceMinor, currency: l.currency, is_weighted: l.isWeighted, tax_rate_basis_points: l.taxRateBasisPoints },
+        l.quantity
+      );
+      acc.subtotalMinor += subtotalMinor;
+      acc.taxMinor += taxMinor;
+      acc.totalMinor += totalMinor;
+      return acc;
+    },
+    { subtotalMinor: 0, taxMinor: 0, totalMinor: 0 }
+  );
+  const discountMinor = 0; // Phase 9B scope — shown for visibility per the CTO plan, not yet computable here.
+  const currency = cart[0]?.currency ?? "EUR";
 
   if (!sessionChecked) {
     return <div className="p-6">Checking register status…</div>;
@@ -300,69 +495,108 @@ export function PosPage() {
         <ConnectivityBadge />
       </header>
 
-      <div className="flex-1 grid grid-cols-[1fr] overflow-hidden">
-        <main className="p-3 overflow-y-auto">
+      <div className="flex-1 grid grid-cols-[10rem_1fr_22rem] overflow-hidden">
+        <CategorySidebar categories={categories} selectedCategoryId={selectedCategoryId} onSelect={setSelectedCategoryId} />
+
+        <main className="p-3 overflow-y-auto border-r">
           <input
+            ref={searchInputRef}
             className="w-full border rounded px-2 py-1 mb-2"
-            placeholder="Search product name or SKU (barcode-scan wedge input is a follow-up task)…"
+            placeholder="Search name, SKU, or scan a barcode…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={handleSearchKeyDown}
           />
+          {products.length === 0 && (search.length > 0 || selectedCategoryId !== null) && (
+            <p className="text-sm text-gray-400 py-4 text-center">No products found.</p>
+          )}
           <div className="grid grid-cols-3 gap-2">
-            {products.map((p) => (
+            {products.map((p, i) => (
               <button
                 key={p.id}
-                onClick={() => addToCart(p)}
-                className="border rounded p-2 text-left hover:bg-gray-50"
+                onClick={() => handleProductActivate(p)}
+                className={`border rounded p-2 text-left hover:bg-gray-50 ${
+                  i === focusedProductIndex ? "ring-2 ring-black" : ""
+                }`}
               >
                 <div className="text-sm font-medium">{p.name}</div>
-                <div className="text-xs text-gray-500">€{(p.price_minor / 100).toFixed(2)}</div>
+                <div className="text-xs text-gray-500">
+                  {formatMoney(p.price_minor, p.currency)}
+                  {p.is_weighted ? " / kg" : ""}
+                </div>
               </button>
             ))}
           </div>
         </main>
+
+        <aside data-testid="cart-summary" className="p-3 overflow-y-auto flex flex-col">
+          {lastReceipt && <p className="text-sm text-green-700 mb-2">{lastReceipt}</p>}
+          {checkoutMutation.isError && (
+            <p className="text-sm text-red-600 mb-2">{(checkoutMutation.error as Error).message}</p>
+          )}
+          <div className="flex-1">
+            <CartPanel
+              lines={cart}
+              selectedProductId={selectedLineId}
+              onSelectLine={setSelectedLineId}
+              onChangeQuantity={changeCartQuantity}
+              onRemoveLine={removeCartLine}
+              onClearCart={clearCart}
+            />
+          </div>
+          <div className="border-t pt-2 mt-2 space-y-1 text-sm">
+            <div className="flex justify-between text-gray-500">
+              <span>Subtotal</span>
+              <span>{formatMoney(totals.subtotalMinor, currency)}</span>
+            </div>
+            <div className="flex justify-between text-gray-500">
+              <span>Discount</span>
+              <span>{formatMoney(discountMinor, currency)}</span>
+            </div>
+            <div className="flex justify-between text-gray-500">
+              <span>Tax</span>
+              <span>{formatMoney(totals.taxMinor, currency)}</span>
+            </div>
+            <div className="flex justify-between font-semibold text-base">
+              <span>Total</span>
+              <span>{formatMoney(totals.totalMinor, currency)}</span>
+            </div>
+          </div>
+          <div className="flex gap-2 mt-2">
+            <button
+              className="flex-1 px-4 py-2 bg-black text-white rounded disabled:opacity-50"
+              disabled={cart.length === 0 || checkoutMutation.isPending}
+              onClick={() => checkoutMutation.mutate()}
+            >
+              {checkoutMutation.isPending ? "Processing…" : "CASH — Complete Sale"}
+            </button>
+          </div>
+          <button className="w-full px-4 py-2 bg-gray-200 rounded mt-2" disabled>
+            CARD (mock provider — Phase 10 gateway pending)
+          </button>
+        </aside>
       </div>
 
-      <section className="border-t p-3">
-        {lastReceipt && <p className="text-sm text-green-700 mb-2">{lastReceipt}</p>}
-        {checkoutMutation.isError && (
-          <p className="text-sm text-red-600 mb-2">{(checkoutMutation.error as Error).message}</p>
-        )}
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="text-left text-gray-500">
-              <th>Product</th>
-              <th>Qty</th>
-              <th>Price</th>
-            </tr>
-          </thead>
-          <tbody>
-            {cart.map((l) => (
-              <tr key={l.productId}>
-                <td>{l.name}</td>
-                <td>{l.quantity}</td>
-                <td>€{((l.unitPriceMinor * l.quantity) / 100).toFixed(2)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <div className="flex justify-between items-center mt-2 font-semibold">
-          <span>Subtotal (tax computed {isElectron() ? "locally, offline-first" : "server-side at checkout"})</span>
-          <span>€{(totalMinor / 100).toFixed(2)}</span>
-        </div>
-        <div className="flex gap-2 mt-2">
-          <button
-            className="px-4 py-2 bg-black text-white rounded disabled:opacity-50"
-            disabled={cart.length === 0 || checkoutMutation.isPending}
-            onClick={() => checkoutMutation.mutate()}
-          >
-            {checkoutMutation.isPending ? "Processing…" : "CASH — Complete Sale"}
-          </button>
-          <button className="px-4 py-2 bg-gray-200 rounded" disabled>
-            CARD (mock provider — Phase 21 for a real gateway)
-          </button>
-        </div>
-      </section>
+      <footer className="border-t px-3 py-1.5 text-xs text-gray-400 flex gap-4">
+        <span>F1 Search</span>
+        <span className="opacity-40">F3 Hold (Phase 9B)</span>
+        <span className="opacity-40">F4 Recall (Phase 9B)</span>
+        <span>↑↓ navigate results · Enter add · Esc clear search</span>
+      </footer>
+
+      {weightDialogProduct && (
+        <WeightEntryDialog
+          productName={weightDialogProduct.name}
+          pricePerKiloMinor={weightDialogProduct.price_minor}
+          currency={weightDialogProduct.currency}
+          onCancel={() => setWeightDialogProduct(null)}
+          onConfirm={(grams) => {
+            addToCart(weightDialogProduct, grams);
+            setWeightDialogProduct(null);
+            setSearch("");
+          }}
+        />
+      )}
     </div>
   );
 }

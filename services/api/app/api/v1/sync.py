@@ -40,6 +40,7 @@ from app.db.session import get_db
 from app.domain.orders import PaymentMethod
 from app.domain.sync import Conflict, DeviceSyncState, InboxEvent
 from app.domain.tenancy import Device
+from app.services.cash_sessions import CashSessionAlreadyOpenError, CashSessionError, CashSessionNotPermittedError, open_cashier_session
 from app.services.checkout import CartLineInput, CheckoutError, PaymentInput, UnauthorizedResourceError, create_pos_sale
 from app.services.ledgerbrug import enqueue_order_event
 
@@ -134,6 +135,88 @@ def _check_and_advance_device_sequence(db: Session, tenant_id: int, device: Devi
     db.flush()
 
 
+def _process_cash_session_open(db: Session, principal: Principal, inbox_row: InboxEvent) -> SyncEventResult:
+    """
+    Phase 22.1: server-side handling of an offline-opened shift syncing in.
+    The device already opened a LOCAL session (sentinel session_id=0,
+    pending_sync=1 — see apps/pos/desktop/electron/offlineShift.ts) before
+    this event ever reaches the network; this is where that gets a real
+    server-side CashierSession, via the exact same centralized
+    open_cashier_session() the direct online route uses (Phase 22.1:
+    "centralize resolve_authorized_register() and use it everywhere",
+    extended to session-open itself).
+
+    Conflict handling mirrors _check_and_advance_device_sequence's
+    philosophy: if a session is ALREADY open on this register by the time
+    this event arrives (another device opened it first, or the same device
+    raced an earlier online open against this offline one), hard-rejecting
+    would strand every order.created event this offline batch is about to
+    sync right behind it — checkout already happened offline, the sale is
+    real, and it needs *a* session to attach to. So this is recorded as a
+    visible Conflict (for a human to review) and then treated as processed,
+    reusing the existing open session rather than blocking on it.
+    """
+    try:
+        register_id = int(inbox_row.payload["register_id"])
+        opening_cash_minor = int(inbox_row.payload["opening_cash_minor"])
+    except (KeyError, ValueError, TypeError) as exc:
+        db.rollback()
+        inbox_row.retry_count += 1
+        inbox_row.last_error = f"cash_session.open payload malformed: {exc}"
+        db.commit()
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=inbox_row.last_error) from exc
+
+    if principal.store_id is None:
+        db.rollback()
+        inbox_row.retry_count += 1
+        inbox_row.last_error = "This user has no store assigned — cannot open a cashier session without a store context"
+        db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=inbox_row.last_error)
+
+    try:
+        session = open_cashier_session(
+            db,
+            tenant_id=principal.tenant_id,
+            store_id=principal.store_id,
+            register_id=register_id,
+            principal=principal,
+            opening_cash_minor=opening_cash_minor,
+        )
+    except CashSessionAlreadyOpenError as exc:
+        # Non-blocking: record the conflict, reuse the existing session, and
+        # mark this event processed so subsequent order.created events in
+        # the same offline batch have a session to attach to.
+        db.add(
+            Conflict(
+                tenant_id=principal.tenant_id,
+                aggregate_type="cash_session",
+                aggregate_id=str(register_id),
+                field="is_open",
+                local_value="opened_offline",
+                remote_value=f"already_open_session_id={exc.existing.id}",
+                resolution="PENDING",
+            )
+        )
+        import datetime as dt
+
+        inbox_row.processed_at = dt.datetime.utcnow()
+        db.commit()
+        return SyncEventResult(
+            status="processed",
+            detail=f"register already had an open session (id={exc.existing.id}); recorded as conflict, reused it",
+        )
+    except CashSessionNotPermittedError as exc:
+        db.rollback()
+        inbox_row.retry_count += 1
+        inbox_row.last_error = str(exc)
+        db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+    inbox_row.processed_at = session.opened_at
+    db.commit()
+    return SyncEventResult(status="processed", detail=f"cashier session {session.id} opened")
+
+
 @router.post("/events", response_model=SyncEventResult)
 def ingest_sync_event(
     body: SyncEventIn,
@@ -190,6 +273,9 @@ def ingest_sync_event(
         _check_and_advance_device_sequence(db, principal.tenant_id, device, body.sequence)
     db.commit()
     db.refresh(inbox_row)
+
+    if body.event_type == "cash_session.open":
+        return _process_cash_session_open(db, principal, inbox_row)
 
     if body.event_type != "order.created":
         inbox_row.retry_count += 1

@@ -91,12 +91,47 @@ class OrderTotals:
     currency: str
 
 
+_GRAMS_PER_KILO = 1000
+
+
 def compute_line_total(product: Product, tax: Tax | None, quantity: int) -> tuple[int, int, int]:
-    """Returns (line_subtotal_minor, line_tax_minor, line_total_minor)."""
+    """Returns (line_subtotal_minor, line_tax_minor, line_total_minor).
+
+    Phase 9A finding: `OrderLine.quantity`'s own docstring ("for weighted
+    items, quantity is grams, integer, not kg-float") and
+    `CartLineInput.quantity`'s docstring say the same thing, but this
+    function used to ignore both and always compute `unit_price *
+    quantity` — for a weighted product (`is_weighted=True`, priced per
+    KILOGRAM in `price_minor`) that silently priced 250g of a product as
+    if it were 250 whole KILOGRAMS, a 4000x overcharge. There was no
+    weighted-product UI yet to have exposed this, so it went unnoticed
+    rather than being a regression. Fixed here at the one place both the
+    direct checkout route and the offline sync path share, per this
+    project's "centralize and use it everywhere" discipline — not
+    duplicated into a second weighted-aware function.
+
+    Non-weighted: quantity is a whole-unit count, price_minor is per unit.
+    Weighted: quantity is grams, price_minor is per kilogram — the line
+    subtotal is `round(price_minor * grams / 1000)`, rounded to the
+    nearest minor currency unit using Python's own `round()` (banker's
+    rounding on an exact .5 tie), the same convention `Money.percentage()`
+    already uses elsewhere in this file, rather than truncated — so a sale
+    doesn't lose fractional cents on every weighted line, and the two
+    roundings in this codebase behave identically rather than drifting on
+    different rules.
+    """
     if quantity <= 0:
         raise InvalidCartError(f"Product {product.id} has non-positive quantity {quantity}")
-    unit_price = Money(product.price_minor, product.currency)
-    line_subtotal = unit_price * quantity
+    if product.is_weighted:
+        # Money has no native "multiply by a fraction and round" helper
+        # (its `*` operator is defined for a whole-number multiplier, per
+        # `Money.__mul__`), so this is done in raw minor units directly —
+        # still integer-only arithmetic throughout, never a float.
+        subtotal_minor = round(product.price_minor * quantity / _GRAMS_PER_KILO)
+        line_subtotal = Money(subtotal_minor, product.currency)
+    else:
+        unit_price = Money(product.price_minor, product.currency)
+        line_subtotal = unit_price * quantity
     line_tax = line_subtotal.percentage(tax.rate_basis_points / 100) if tax else Money(0, product.currency)
     return line_subtotal.minor_units, line_tax.minor_units, (line_subtotal + line_tax).minor_units
 

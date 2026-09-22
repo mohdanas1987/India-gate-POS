@@ -28,12 +28,22 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("auth:save-context", ctx),
   getCachedAuthContext: () => ipcRenderer.invoke("auth:get-cached-context"),
   syncCatalog: () => ipcRenderer.invoke("catalog:sync"),
-  searchLocalProducts: (query: string) => ipcRenderer.invoke("catalog:search", query),
+  searchLocalProducts: (query: string | null, categoryId?: number | null) =>
+    ipcRenderer.invoke("catalog:search", query, categoryId ?? null),
+  listLocalCategories: () => ipcRenderer.invoke("catalog:list-categories"),
   cacheOpenSession: (session: {
     session_id: number; register_id: number; store_id: number; tenant_id: number; cashier_user_id: number; opened_at: string;
   }) => ipcRenderer.invoke("cash:cache-session", session),
   getCachedOpenSession: () => ipcRenderer.invoke("cash:get-cached-session"),
   checkoutOffline: (cart: { productId: number; quantity: number }[]) => ipcRenderer.invoke("checkout:offline", cart),
+
+  // Phase 22.1 — offline shift-start (CTO gate: "device starts offline,
+  // cashier wants to open shift, checkout" was previously unsupported).
+  cacheOfflineCredential: (email: string, password: string) =>
+    ipcRenderer.invoke("auth:cache-offline-credential", { email, password }),
+  offlineLogin: (email: string, password: string) => ipcRenderer.invoke("auth:offline-login", { email, password }),
+  openShiftOffline: (registerId: number, openingCashMinor: number) =>
+    ipcRenderer.invoke("cash:open-shift-offline", { registerId, openingCashMinor }),
   getConnectivityState: () => ipcRenderer.invoke("sync:get-connectivity-state"),
   onConnectivityChanged: (callback: (state: string) => void) =>
     ipcRenderer.on("sync:connectivity-changed", (_evt, state) => callback(state)),

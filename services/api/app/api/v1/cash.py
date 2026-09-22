@@ -12,6 +12,7 @@ from app.core.security import Principal
 from app.db.session import get_db
 from app.domain.cash import CashierSession
 from app.services.authorization import AuthorizationError, resolve_authorized_register
+from app.services.cash_sessions import CashSessionAlreadyOpenError, CashSessionNotPermittedError, open_cashier_session
 
 router = APIRouter(prefix="/cash", tags=["cash"])
 
@@ -84,34 +85,27 @@ def open_session(
             detail="This user has no store assigned — cannot open a cashier session without a store context",
         )
 
-    # CTO audit of 0cfd8ca, finding #7 (the same architectural problem as
-    # checkout's finding #6): this used to filter only on
-    # CashierSession.register_id == body.register_id, trusting that "if
-    # the user says register_id=7, register 7 belongs to their store."
-    # It doesn't get to assume that — it has to prove it, via the same
-    # centralized resolver checkout.py uses.
+    # Phase 22.1: pulled into a shared service (app/services/cash_sessions.py)
+    # so the offline sync path (app/api/v1/sync.py's "cash_session.open"
+    # handling) enforces exactly the same register-ownership check and
+    # independent cash.manage_session permission check as this route does
+    # — "centralize resolve_authorized_register() and use it everywhere"
+    # applied to session-open itself, not just to the check inside it.
     try:
-        resolve_authorized_register(db, principal.tenant_id, principal.store_id, body.register_id)
-    except AuthorizationError as exc:
+        session = open_cashier_session(
+            db,
+            tenant_id=principal.tenant_id,
+            store_id=principal.store_id,
+            register_id=body.register_id,
+            principal=principal,
+            opening_cash_minor=body.opening_cash_minor,
+        )
+    except CashSessionAlreadyOpenError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except CashSessionNotPermittedError as exc:
+        db.rollback()
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-
-    existing = (
-        db.query(CashierSession)
-        .filter(CashierSession.register_id == body.register_id, CashierSession.is_open.is_(True))
-        .first()
-    )
-    if existing:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="A session is already open on this register")
-
-    session = CashierSession(
-        tenant_id=principal.tenant_id,
-        store_id=principal.store_id,
-        register_id=body.register_id,
-        cashier_user_id=principal.user_id,
-        opening_cash_minor=body.opening_cash_minor,
-        is_open=True,
-    )
-    db.add(session)
     db.commit()
     db.refresh(session)
     return session

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.rbac import require_permission
@@ -26,6 +26,11 @@ class ProductOut(BaseModel):
     unit: str
     is_weighted: bool
     tax_id: int | None
+    # Phase 9A: the category sidebar needs to know which category a
+    # product belongs to once it's returned from a category-filtered (or
+    # unfiltered) search — previously absent from this contract even
+    # though `Product.category_id` has existed since Phase 3.
+    category_id: int | None = None
     # Added for the Phase 8 offline catalog rebuild: the Electron app
     # snapshots this into its local SQLite catalog so a sale can be priced
     # AND taxed correctly with zero network calls, instead of only caching
@@ -48,6 +53,7 @@ class ProductOut(BaseModel):
             unit=product.unit,
             is_weighted=product.is_weighted,
             tax_id=product.tax_id,
+            category_id=product.category_id,
             tax_rate_basis_points=tax.rate_basis_points if tax else None,
             barcodes=[b.code for b in product.barcodes],
         )
@@ -56,6 +62,7 @@ class ProductOut(BaseModel):
 @router.get("", response_model=list[ProductOut])
 def search_products(
     q: str | None = None,
+    category_id: int | None = None,
     limit: int = 50,
     db: Session = Depends(get_db),
     principal: Principal = Depends(require_permission("orders.create")),
@@ -70,7 +77,28 @@ def search_products(
     )
     if q:
         like = f"%{q}%"
-        query = query.where((Product.name.ilike(like)) | (Product.sku.ilike(like)))
+        # Phase 9A: the gap analysis found this only ever matched
+        # name/SKU — a cashier typing (or a keyboard-wedge scanner
+        # injecting) a barcode into the same search box got zero results
+        # and had to know to hit the separate /products/barcode/{code}
+        # lookup instead. A search-time outerjoin against Barcode closes
+        # that gap without touching the dedicated exact-lookup route,
+        # which stays for the "we already know this is a barcode" case.
+        # distinct() guards against a product with multiple barcodes
+        # coming back more than once for one query.
+        query = (
+            query.outerjoin(Barcode, Barcode.product_id == Product.id)
+            .where(or_(Product.name.ilike(like), Product.sku.ilike(like), Barcode.code.ilike(like)))
+            .distinct()
+        )
+    if category_id is not None:
+        # Phase 9A category sidebar: filter to one category at a time.
+        # No tenant cross-check needed on category_id itself beyond this
+        # — a category from another tenant simply matches zero products
+        # because Product.category_id + Product.tenant_id are filtered
+        # together, so it fails closed rather than needing a separate
+        # resolve-and-403 step for a read-only filter.
+        query = query.where(Product.category_id == category_id)
     # `limit` is also used by the Electron app's offline catalog-sync pull
     # (Phase 8 rebuild) to fetch the full pos_visible catalog in one call
     # rather than being capped at 50 forever.

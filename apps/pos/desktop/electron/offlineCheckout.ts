@@ -49,11 +49,29 @@ export interface OfflineReceipt {
   createdAt: string;
 }
 
+const GRAMS_PER_KILO = 1000;
+
+/**
+ * Phase 9A finding (mirrors the identical fix in
+ * services/api/app/services/checkout.py::compute_line_total — the two
+ * must compute IDENTICALLY, per this file's own module docstring above,
+ * or a receipt printed offline would show a different total than the
+ * server later computes when the sale syncs): this used to always do
+ * `price_minor * quantity`, ignoring `is_weighted`. For a weighted
+ * product (price_minor is EUR per KILOGRAM, quantity is GRAMS — see
+ * schema.ts's LocalProductRow / the server's OrderLine.quantity
+ * docstring), that silently overcharged by 1000x. Weighted math now
+ * matches the server exactly: `round(price_minor * grams / 1000)`, using
+ * JS's own `Math.round()` (round-half-up on an exact .5, same as the
+ * tax rounding immediately below) rather than truncating.
+ */
 function computeLineTotal(product: LocalProductRow, quantity: number): { subtotal: number; tax: number; total: number } {
   if (quantity <= 0) {
     throw new OfflineCheckoutError(`Product ${product.id} has non-positive quantity ${quantity}`);
   }
-  const subtotal = product.price_minor * quantity;
+  const subtotal = product.is_weighted
+    ? Math.round((product.price_minor * quantity) / GRAMS_PER_KILO)
+    : product.price_minor * quantity;
   const tax = product.tax_rate_basis_points ? Math.round((subtotal * product.tax_rate_basis_points) / 10000) : 0;
   return { subtotal, tax, total: subtotal + tax };
 }

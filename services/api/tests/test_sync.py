@@ -165,3 +165,204 @@ def test_unknown_event_type_is_rejected_not_silently_accepted(db, synced_setup):
         ingest_sync_event(body, db, synced_setup["principal"])
     assert exc_info.value.status_code == 422
     assert "Unsupported event_type" in exc_info.value.detail
+
+
+# --- Phase 22.1: cash_session.open sync event (offline shift-start) ---
+
+
+def _cash_session_open_event(register_id: int, opening_cash_minor: int = 10000, sequence: int = 1) -> SyncEventIn:
+    return SyncEventIn(
+        event_id=str(uuid.uuid4()),
+        aggregate_type="cash_session",
+        aggregate_id="local-session-1",
+        sequence=sequence,
+        event_type="cash_session.open",
+        payload={"register_id": register_id, "opening_cash_minor": opening_cash_minor},
+    )
+
+
+@pytest.fixture
+def unopened_register_setup(db):
+    """Same shape as synced_setup, but with NO CashierSession pre-opened —
+    needed because synced_setup's register already has one open, which
+    would make every 'happy path' cash_session.open test hit the
+    already-open conflict branch instead."""
+    tenant = seed_all(db)
+    user = User(tenant_id=tenant.id, name="Offline Cashier 2", email="offline-cashier-2@test-fixture.local", password_hash="x")
+    db.add(user)
+    db.flush()
+    db.commit()
+
+    store = db.query(Store).filter(Store.tenant_id == tenant.id).first()
+    register = db.query(Register).filter(Register.store_id == store.id).first()
+
+    principal = Principal(user_id=user.id, tenant_id=tenant.id, role="Cashier", store_id=store.id)
+    return {"principal": principal, "register_id": register.id}
+
+
+def test_cash_session_open_sync_event_creates_a_real_session(db, unopened_register_setup):
+    body = _cash_session_open_event(unopened_register_setup["register_id"])
+
+    result = ingest_sync_event(body, db, unopened_register_setup["principal"])
+    assert result.status == "processed"
+
+    session = (
+        db.query(CashierSession)
+        .filter(CashierSession.register_id == unopened_register_setup["register_id"], CashierSession.is_open.is_(True))
+        .first()
+    )
+    assert session is not None
+    assert session.opening_cash_minor == 10000
+    assert session.cashier_user_id == unopened_register_setup["principal"].user_id
+
+
+def test_cash_session_open_is_idempotent_on_replay(db, unopened_register_setup):
+    body = _cash_session_open_event(unopened_register_setup["register_id"])
+
+    first = ingest_sync_event(body, db, unopened_register_setup["principal"])
+    assert first.status == "processed"
+
+    second = ingest_sync_event(body, db, unopened_register_setup["principal"])
+    assert second.status == "already_processed"
+
+    # Only one CashierSession must exist — the replay must not have opened
+    # a second one nor recorded a spurious conflict.
+    sessions = (
+        db.query(CashierSession)
+        .filter(CashierSession.register_id == unopened_register_setup["register_id"], CashierSession.is_open.is_(True))
+        .all()
+    )
+    assert len(sessions) == 1
+
+
+def test_cash_session_open_without_permission_is_rejected(db, unopened_register_setup):
+    """A principal whose role holds no cash.manage_session (e.g. Inventory
+    Manager, per seed.py) must be rejected — not silently allowed to open a
+    register session just because it reached this endpoint via the
+    orders.create-gated sync route."""
+    body = _cash_session_open_event(unopened_register_setup["register_id"])
+    no_permission_principal = Principal(
+        user_id=unopened_register_setup["principal"].user_id,
+        tenant_id=unopened_register_setup["principal"].tenant_id,
+        role="Inventory Manager",
+        store_id=unopened_register_setup["principal"].store_id,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        ingest_sync_event(body, db, no_permission_principal)
+    assert exc_info.value.status_code == 403
+
+    sessions = (
+        db.query(CashierSession)
+        .filter(CashierSession.register_id == unopened_register_setup["register_id"], CashierSession.is_open.is_(True))
+        .all()
+    )
+    assert sessions == []
+
+
+def test_cash_session_open_for_a_register_in_another_store_is_rejected(db, unopened_register_setup):
+    """Register-ownership enforcement (same discipline as the direct
+    cash.py route and get_current_session): a register that does not
+    belong to the caller's own store must be refused, even though this
+    request arrived through the sync endpoint rather than
+    POST /api/v1/cash/session/open directly."""
+    from app.domain.tenancy import Store as StoreModel
+
+    other_store = StoreModel(tenant_id=unopened_register_setup["principal"].tenant_id, name="Other Store")
+    db.add(other_store)
+    db.flush()
+    other_register = Register(store_id=other_store.id, name="Other Register")
+    db.add(other_register)
+    db.flush()
+    db.commit()
+
+    body = _cash_session_open_event(other_register.id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        ingest_sync_event(body, db, unopened_register_setup["principal"])
+    assert exc_info.value.status_code == 403
+
+    sessions = db.query(CashierSession).filter(CashierSession.register_id == other_register.id).all()
+    assert sessions == []
+
+
+def test_cash_session_already_open_is_recorded_as_conflict_not_rejected(db, synced_setup):
+    """synced_setup's register already has an open CashierSession (opened
+    directly, simulating another device or an earlier online open). An
+    offline device's cash_session.open syncing in for that same register
+    must NOT hard-fail — that would strand every order.created event the
+    same offline batch is about to sync right behind it. It must instead
+    record a Conflict and report success, reusing the existing session."""
+    from app.domain.sync import Conflict
+
+    existing_session = (
+        db.query(CashierSession)
+        .filter(CashierSession.register_id == synced_setup["register_id"], CashierSession.is_open.is_(True))
+        .first()
+    )
+    assert existing_session is not None  # sanity: synced_setup really does pre-open one
+
+    body = _cash_session_open_event(synced_setup["register_id"])
+    result = ingest_sync_event(body, db, synced_setup["principal"])
+
+    assert result.status == "processed"
+
+    # Still exactly one open session on that register — the conflicting
+    # offline open did not create a duplicate.
+    open_sessions = (
+        db.query(CashierSession)
+        .filter(CashierSession.register_id == synced_setup["register_id"], CashierSession.is_open.is_(True))
+        .all()
+    )
+    assert len(open_sessions) == 1
+    assert open_sessions[0].id == existing_session.id
+
+    conflict = (
+        db.query(Conflict)
+        .filter(Conflict.aggregate_type == "cash_session", Conflict.aggregate_id == str(synced_setup["register_id"]))
+        .first()
+    )
+    assert conflict is not None
+    assert conflict.resolution == "PENDING"
+    assert str(existing_session.id) in conflict.remote_value
+
+    # The event must be marked processed (not left retrying forever) even
+    # though it hit a conflict.
+    inbox_row = db.query(InboxEvent).filter(InboxEvent.event_id == body.event_id).first()
+    assert inbox_row.processed_at is not None
+
+
+def test_cash_session_open_then_order_created_in_same_batch_succeeds(db, unopened_register_setup):
+    """The ordering guarantee this whole feature depends on: an offline
+    device enqueues cash_session.open at a lower sequence number than the
+    order.created events from the same shift (apps/pos/desktop/electron/
+    offlineShift.ts + outboxSync.ts's ORDER BY sequence ASC). This proves
+    that once both arrive at the server in that order, the second event
+    finds a real session to attach the sale to — the actual point of
+    Phase 22.1, not just that each event type works in isolation."""
+    tenant_principal = unopened_register_setup["principal"]
+    register_id = unopened_register_setup["register_id"]
+
+    open_body = _cash_session_open_event(register_id, sequence=1)
+    open_result = ingest_sync_event(open_body, db, tenant_principal)
+    assert open_result.status == "processed"
+
+    # Need a real product to sell — reuse seed_all's category/tax setup.
+    tenant = db.query(User).filter(User.id == tenant_principal.user_id).first().tenant_id
+    category = db.query(Category).filter(Category.slug == "grocery", Category.tenant_id == tenant).first()
+    tax = Tax(tenant_id=tenant, name="Standard 22.1", rate_basis_points=2100)
+    db.add(tax)
+    db.flush()
+    product = Product(
+        tenant_id=tenant, category_id=category.id, tax_id=tax.id, sku="OFFLINE-SHIFT-TEST",
+        name="Offline Shift Test Item", price_minor=500, currency="EUR", unit="piece",
+    )
+    db.add(product)
+    db.flush()
+    db.commit()
+
+    order_body = _event(product.id, register_id, quantity=1)
+    order_body.sequence = 2
+    order_result = ingest_sync_event(order_body, db, tenant_principal)
+    assert order_result.status == "processed"
+    assert order_result.order_id is not None

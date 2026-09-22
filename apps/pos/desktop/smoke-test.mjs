@@ -36,7 +36,7 @@ await page.click('button[type="submit"]');
 // non-reproducible precondition the audit called out.
 try {
   await Promise.race([
-    page.waitForSelector('input[placeholder*="Search product"]', { timeout: 8000 }),
+    page.waitForSelector('input[placeholder*="Search name"]', { timeout: 8000 }),
     page.waitForSelector("text=Open Register", { timeout: 8000 }),
   ]);
 } catch (e) {
@@ -50,23 +50,36 @@ if (needsRegisterOpen > 0) {
   console.log("STEP 2a: no open cashier session found — opening one via the real UI");
   await page.fill('input[placeholder="Opening cash (€)"]', "100.00");
   await page.click('button:has-text("Open Register")');
-  await page.waitForSelector('input[placeholder*="Search product"]', { timeout: 8000 });
+  await page.waitForSelector('input[placeholder*="Search name"]', { timeout: 8000 });
 }
 console.log("STEP 2 OK: logged in, POS screen shown (register open, real session in place)");
 
-await page.fill('input[placeholder*="Search product"]', "rice");
+// Phase 9A: category sidebar now exists — confirm it renders with a real
+// "All Products" entry (categories load from GET /api/v1/categories).
+await page.waitForSelector("text=All Products", { timeout: 5000 });
+console.log("STEP 2b OK: category sidebar rendered");
+
+await page.fill('input[placeholder*="Search name"]', "rice");
 await page.waitForSelector("text=Basmati Rice 5kg", { timeout: 5000 });
 console.log("STEP 3 OK: product search returned real backend data");
 
 await page.click("text=Basmati Rice 5kg");
 await page.waitForSelector("text=CASH — Complete Sale");
-const cartText = await page.textContent("section.border-t");
+const cartText = await page.textContent('[data-testid="cart-summary"]');
 if (!cartText.includes("Basmati Rice")) throw new Error("Product not added to cart");
 console.log("STEP 4 OK: product added to cart");
 
+// Phase 9A: cart rebuild — quantity +/- controls now exist per line.
+await page.click('button[aria-label="Increase quantity of Basmati Rice 5kg"]');
+const cartTextAfterIncrement = await page.textContent('[data-testid="cart-summary"]');
+if (!cartTextAfterIncrement.includes("25.98")) {
+  throw new Error("Quantity +1 did not update the line total to 2x12.99=25.98: " + cartTextAfterIncrement);
+}
+console.log("STEP 4b OK: quantity +/- control updates the line total correctly (2 x 12.99 = 25.98)");
+
 await page.click("text=CASH — Complete Sale");
 await page.waitForSelector("text=/Order #\\d+/", { timeout: 5000 });
-const receiptText = await page.textContent("section.border-t");
+const receiptText = await page.textContent('[data-testid="cart-summary"]');
 console.log("STEP 5 OK: checkout completed ->", receiptText.match(/Order #\d+.*?\d+\.\d{2}/)[0]);
 
 if (errors.length > 0) {

@@ -19,11 +19,28 @@ export function LoginPage() {
     setError(null);
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/auth/login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
-      });
+      let res: Response;
+      try {
+        res = await fetch(`${API_BASE}/api/v1/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        });
+      } catch (networkErr) {
+        // Phase 22.1 (CTO gate: "device starts offline -> cashier wants
+        // to open shift -> checkout" was previously unsupported). A
+        // genuine network failure (server unreachable), not a login
+        // rejection — try the offline path, which only succeeds if this
+        // exact device previously cached credentials from a real online
+        // login. Outside Electron there is no offline path at all: the
+        // Playwright smoke test's plain browser has no local device
+        // database to check against.
+        if (!isElectron()) throw networkErr;
+        const offline = await window.electronAPI!.offlineLogin(email, password);
+        if (!offline.ok) throw new Error(offline.error);
+        navigate("/pos");
+        return;
+      }
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.detail ?? `Login failed (HTTP ${res.status})`);
@@ -39,6 +56,12 @@ export function LoginPage() {
         // OS keychain (Electron's safeStorage) — see electron/main.ts.
         // The renderer never sees it again after this call.
         await window.electronAPI!.saveAuthToken(data.access_token);
+        // Phase 22.1: this is the ONLY place a plaintext password is ever
+        // available — cache a local bcrypt hash of it now, immediately
+        // after the server has proven it correct, so a future offline
+        // login on this same device has something to verify against.
+        // The plaintext password itself is never persisted anywhere.
+        await window.electronAPI!.cacheOfflineCredential(email, password);
         const meRes = await window.electronAPI!.authedRequest({ path: "/api/v1/auth/me" });
         if (meRes.ok) {
           const me = meRes.body as { user_id: number; tenant_id: number; store_id: number | null; role: string };

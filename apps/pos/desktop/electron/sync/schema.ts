@@ -69,6 +69,7 @@ export function openLocalDb(filePath: string): Database.Database {
       currency TEXT NOT NULL DEFAULT 'EUR',
       unit TEXT NOT NULL DEFAULT 'piece',
       is_weighted INTEGER NOT NULL DEFAULT 0,
+      category_id INTEGER,             -- Phase 9A: same server Category id, NULL if uncategorized
       tax_rate_basis_points INTEGER,   -- NULL = no tax, matches server's tax_id NULL case
       barcodes TEXT NOT NULL DEFAULT '[]',  -- JSON array of barcode strings
       synced_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -76,12 +77,30 @@ export function openLocalDb(filePath: string): Database.Database {
 
     CREATE INDEX IF NOT EXISTS idx_local_products_name ON local_products(name);
     CREATE INDEX IF NOT EXISTS idx_local_products_sku ON local_products(sku);
+    CREATE INDEX IF NOT EXISTS idx_local_products_category ON local_products(category_id);
 
-    -- Holds at most one row: the currently-open cashier session, cached
-    -- from the last successful (online) /api/v1/cash/session/open call.
-    -- This is what lets checkout validate "is there an open session"
-    -- without a network round-trip. Opening/closing a session itself still
-    -- requires connectivity (disclosed limitation — see PHASE-STATUS.md).
+    -- Phase 9A: the category sidebar needs to work OFFLINE too (per the
+    -- CTO plan's own Phase 9A offline acceptance criteria — "cached
+    -- catalog -> product search -> add product ... must work without HTTP
+    -- dependency"), so category names/slugs are synced down alongside
+    -- the product catalog, not fetched live from GET /api/v1/categories
+    -- every time the sidebar renders.
+    CREATE TABLE IF NOT EXISTS local_categories (
+      id INTEGER PRIMARY KEY,          -- same id as the server Category row
+      name TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Holds at most one row: the currently-open cashier session. Cached
+    -- from a successful (online) /api/v1/cash/session/open call, OR
+    -- (Phase 22.1) opened locally while genuinely offline — see
+    -- electron/offlineShift.ts. This is what lets checkout validate "is
+    -- there an open session" without a network round-trip either way.
+    -- pending_sync = 1 and session_id = 0 together mean "opened
+    -- offline, the real server-side CashierSession id is not known yet" —
+    -- checkout doesn't need the real id, only register/store/tenant, so
+    -- it works identically either way.
     CREATE TABLE IF NOT EXISTS local_register_session (
       id INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton row
       session_id INTEGER NOT NULL,
@@ -89,7 +108,8 @@ export function openLocalDb(filePath: string): Database.Database {
       store_id INTEGER NOT NULL,
       tenant_id INTEGER NOT NULL,
       cashier_user_id INTEGER NOT NULL,
-      opened_at TEXT NOT NULL
+      opened_at TEXT NOT NULL,
+      pending_sync INTEGER NOT NULL DEFAULT 0
     );
 
     -- Cached auth context (from the last successful login) so the app
@@ -104,6 +124,36 @@ export function openLocalDb(filePath: string): Database.Database {
       role TEXT NOT NULL,
       cached_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    -- Phase 22.1 (offline shift-start — CTO gate: "device starts offline,
+    -- cashier wants to open shift, checkout" was previously unsupported).
+    -- A locally-verifiable credential, cached ONLY after a real successful
+    -- online login — never fetched from or synced to the server as a
+    -- separate step, and never the server's own password hash: this is a
+    -- fresh bcrypt hash of the plaintext password computed HERE, in the
+    -- main process, the moment online login succeeds (see
+    -- electron/offlineShift.ts::cacheOfflineCredential). That means an
+    -- offline login can only ever succeed for a device that has
+    -- previously proven itself online with the real server — it is not a
+    -- new, weaker credential store.
+    CREATE TABLE IF NOT EXISTS offline_credential (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      email TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      cached_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- The register this device has actually been proven, ONLINE, to be
+    -- authorized for (via resolve_authorized_register on the server, the
+    -- last time /api/v1/cash/session/open succeeded here). Offline shift
+    -- start is only ever allowed to reopen THIS register — never an
+    -- arbitrary register_id a cashier might type in, since there is no
+    -- way to verify tenant/store/register ownership without the server.
+    CREATE TABLE IF NOT EXISTS local_known_register (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      register_id INTEGER NOT NULL,
+      known_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   // Phase 8.5 (CTO audit of 0cfd8ca, finding #18): next_attempt_at is new
@@ -117,6 +167,21 @@ export function openLocalDb(filePath: string): Database.Database {
     db.exec(`ALTER TABLE outbox_events ADD COLUMN next_attempt_at TEXT NOT NULL DEFAULT (datetime('now'))`);
   }
 
+  // Phase 22.1: same situation for local_register_session on a database
+  // created before offline shift-start existed.
+  const sessionColumns = db.prepare(`PRAGMA table_info(local_register_session)`).all() as { name: string }[];
+  if (!sessionColumns.some((c) => c.name === "pending_sync")) {
+    db.exec(`ALTER TABLE local_register_session ADD COLUMN pending_sync INTEGER NOT NULL DEFAULT 0`);
+  }
+
+  // Phase 9A: same situation for local_products on a database created
+  // before the category sidebar existed.
+  const productColumns = db.prepare(`PRAGMA table_info(local_products)`).all() as { name: string }[];
+  if (!productColumns.some((c) => c.name === "category_id")) {
+    db.exec(`ALTER TABLE local_products ADD COLUMN category_id INTEGER`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_local_products_category ON local_products(category_id)`);
+  }
+
   return db;
 }
 
@@ -128,6 +193,7 @@ export interface LocalProductRow {
   currency: string;
   unit: string;
   is_weighted: number;
+  category_id: number | null;
   tax_rate_basis_points: number | null;
   barcodes: string; // JSON-encoded string[]
 }
@@ -140,21 +206,76 @@ export function replaceLocalCatalog(db: Database.Database, products: LocalProduc
   const tx = db.transaction((rows: LocalProductRow[]) => {
     db.prepare(`DELETE FROM local_products`).run();
     const insert = db.prepare(
-      `INSERT INTO local_products (id, name, sku, price_minor, currency, unit, is_weighted, tax_rate_basis_points, barcodes)
-       VALUES (@id, @name, @sku, @price_minor, @currency, @unit, @is_weighted, @tax_rate_basis_points, @barcodes)`
+      `INSERT INTO local_products (id, name, sku, price_minor, currency, unit, is_weighted, category_id, tax_rate_basis_points, barcodes)
+       VALUES (@id, @name, @sku, @price_minor, @currency, @unit, @is_weighted, @category_id, @tax_rate_basis_points, @barcodes)`
     );
     for (const row of rows) insert.run(row);
   });
   tx(products);
 }
 
-export function searchLocalProducts(db: Database.Database, query: string, limit = 50): LocalProductRow[] {
-  const like = `%${query}%`;
+export interface LocalCategoryRow {
+  id: number;
+  name: string;
+  slug: string;
+}
+
+export function replaceLocalCategories(db: Database.Database, categories: LocalCategoryRow[]): void {
+  const tx = db.transaction((rows: LocalCategoryRow[]) => {
+    db.prepare(`DELETE FROM local_categories`).run();
+    const insert = db.prepare(`INSERT INTO local_categories (id, name, slug) VALUES (@id, @name, @slug)`);
+    for (const row of rows) insert.run(row);
+  });
+  tx(categories);
+}
+
+export interface LocalCategoryWithCount extends LocalCategoryRow {
+  product_count: number;
+}
+
+export function listLocalCategories(db: Database.Database): LocalCategoryWithCount[] {
+  // Mirrors GET /api/v1/categories's own count query (POS-sellable
+  // products only) so the sidebar shows the same numbers online and
+  // offline — see app/api/v1/categories.py's list_categories().
   return db
     .prepare(
-      `SELECT * FROM local_products WHERE name LIKE ? OR sku LIKE ? OR barcodes LIKE ? ORDER BY name LIMIT ?`
+      `SELECT c.id, c.name, c.slug, COUNT(p.id) AS product_count
+       FROM local_categories c
+       LEFT JOIN local_products p ON p.category_id = c.id
+       GROUP BY c.id, c.name, c.slug
+       ORDER BY c.name`
     )
-    .all(like, like, like, limit) as LocalProductRow[];
+    .all() as LocalCategoryWithCount[];
+}
+
+export function searchLocalProducts(
+  db: Database.Database,
+  query: string | null,
+  categoryId: number | null = null,
+  limit = 50
+): LocalProductRow[] {
+  const clauses: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (query) {
+    const like = `%${query}%`;
+    // Phase 9A: matches name/SKU/barcode, mirroring the server's
+    // GET /api/v1/products search (app/api/v1/products.py) so a barcode
+    // scanner's keyboard-wedge input works identically online and
+    // offline — previously this only ever matched name/sku here too.
+    clauses.push(`(name LIKE ? OR sku LIKE ? OR barcodes LIKE ?)`);
+    params.push(like, like, like);
+  }
+  if (categoryId !== null) {
+    clauses.push(`category_id = ?`);
+    params.push(categoryId);
+  }
+
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  params.push(limit);
+  return db
+    .prepare(`SELECT * FROM local_products ${where} ORDER BY name LIMIT ?`)
+    .all(...params) as LocalProductRow[];
 }
 
 export function getLocalProduct(db: Database.Database, id: number): LocalProductRow | undefined {
@@ -190,16 +311,17 @@ export interface LocalRegisterSession {
   tenant_id: number;
   cashier_user_id: number;
   opened_at: string;
+  pending_sync?: number; // 1 = opened offline, server-side CashierSession id not confirmed yet
 }
 
 export function saveLocalRegisterSession(db: Database.Database, s: LocalRegisterSession): void {
   db.prepare(
-    `INSERT INTO local_register_session (id, session_id, register_id, store_id, tenant_id, cashier_user_id, opened_at)
-     VALUES (1, @session_id, @register_id, @store_id, @tenant_id, @cashier_user_id, @opened_at)
+    `INSERT INTO local_register_session (id, session_id, register_id, store_id, tenant_id, cashier_user_id, opened_at, pending_sync)
+     VALUES (1, @session_id, @register_id, @store_id, @tenant_id, @cashier_user_id, @opened_at, @pending_sync)
      ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, register_id=excluded.register_id,
        store_id=excluded.store_id, tenant_id=excluded.tenant_id, cashier_user_id=excluded.cashier_user_id,
-       opened_at=excluded.opened_at`
-  ).run(s);
+       opened_at=excluded.opened_at, pending_sync=excluded.pending_sync`
+  ).run({ ...s, pending_sync: s.pending_sync ?? 0 });
 }
 
 export function getLocalRegisterSession(db: Database.Database): LocalRegisterSession | undefined {
@@ -220,4 +342,40 @@ export function nextSequence(db: Database.Database): number {
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`
   ).run(String(next));
   return next;
+}
+
+// --- Phase 22.1: offline shift-start primitives ---
+
+export interface OfflineCredential {
+  email: string;
+  password_hash: string;
+}
+
+export function saveOfflineCredential(db: Database.Database, cred: OfflineCredential): void {
+  db.prepare(
+    `INSERT INTO offline_credential (id, email, password_hash, cached_at)
+     VALUES (1, @email, @password_hash, datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET email=excluded.email, password_hash=excluded.password_hash, cached_at=excluded.cached_at`
+  ).run(cred);
+}
+
+export function getOfflineCredential(db: Database.Database): OfflineCredential | undefined {
+  return db.prepare(`SELECT email, password_hash FROM offline_credential WHERE id = 1`).get() as
+    | OfflineCredential
+    | undefined;
+}
+
+export function saveKnownRegister(db: Database.Database, registerId: number): void {
+  db.prepare(
+    `INSERT INTO local_known_register (id, register_id, known_at)
+     VALUES (1, ?, datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET register_id=excluded.register_id, known_at=excluded.known_at`
+  ).run(registerId);
+}
+
+export function getKnownRegisterId(db: Database.Database): number | undefined {
+  const row = db.prepare(`SELECT register_id FROM local_known_register WHERE id = 1`).get() as
+    | { register_id: number }
+    | undefined;
+  return row?.register_id;
 }

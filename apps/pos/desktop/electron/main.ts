@@ -22,15 +22,20 @@ import { ElectronPrinterProvider, ElectronCashDrawerProvider, ElectronBarcodePri
 import {
   openLocalDb,
   replaceLocalCatalog,
+  replaceLocalCategories,
+  listLocalCategories,
   searchLocalProducts,
   saveLocalAuthContext,
   getLocalAuthContext,
   saveLocalRegisterSession,
   getLocalRegisterSession,
+  saveKnownRegister,
   LocalProductRow,
+  LocalCategoryRow,
 } from "./sync/schema";
 import { OutboxSyncEngine, ConnectivityState } from "./sync/outboxSync";
 import { checkoutOffline, OfflineCheckoutError, OfflineCartLine } from "./offlineCheckout";
+import { cacheOfflineCredential, verifyOfflineLogin, openShiftOffline, OfflineAuthError, OfflineShiftError } from "./offlineShift";
 
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 const isDev = !!DEV_SERVER_URL;
@@ -201,6 +206,19 @@ ipcMain.handle("auth:get-cached-context", () => {
 ipcMain.handle("catalog:sync", async () => {
   const token = loadTokenSecurely();
   if (!token) throw new Error("Cannot sync catalog: not logged in");
+
+  // Phase 9A: the category sidebar needs an offline snapshot of
+  // categories too (see schema.ts's local_categories table docstring) —
+  // pulled in the same sync action as the product catalog so the two
+  // never drift out of sync with each other on the device.
+  const categoriesRes = await fetch(`${API_BASE}/api/v1/categories`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!categoriesRes.ok) throw new Error(`Category sync failed: HTTP ${categoriesRes.status}`);
+  const categories = (await categoriesRes.json()) as Array<{ id: number; name: string; slug: string }>;
+  const categoryRows: LocalCategoryRow[] = categories.map((c) => ({ id: c.id, name: c.name, slug: c.slug }));
+  replaceLocalCategories(localDb, categoryRows);
+
   const res = await fetch(`${API_BASE}/api/v1/products?limit=1000`, {
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -213,6 +231,7 @@ ipcMain.handle("catalog:sync", async () => {
     currency: string;
     unit: string;
     is_weighted: boolean;
+    category_id: number | null;
     tax_rate_basis_points: number | null;
     barcodes: string[];
   }>;
@@ -224,25 +243,60 @@ ipcMain.handle("catalog:sync", async () => {
     currency: p.currency,
     unit: p.unit,
     is_weighted: p.is_weighted ? 1 : 0,
+    category_id: p.category_id,
     tax_rate_basis_points: p.tax_rate_basis_points,
     barcodes: JSON.stringify(p.barcodes ?? []),
   }));
   replaceLocalCatalog(localDb, rows);
-  return { count: rows.length };
+  return { count: rows.length, categoryCount: categoryRows.length };
 });
 
-ipcMain.handle("catalog:search", (_evt, query: string) => {
-  return searchLocalProducts(localDb, query);
+ipcMain.handle("catalog:search", (_evt, query: string | null, categoryId: number | null) => {
+  return searchLocalProducts(localDb, query, categoryId ?? null);
+});
+
+ipcMain.handle("catalog:list-categories", () => {
+  return listLocalCategories(localDb);
 });
 
 ipcMain.handle("cash:cache-session", (_evt, session: {
   session_id: number; register_id: number; store_id: number; tenant_id: number; cashier_user_id: number; opened_at: string;
 }) => {
   saveLocalRegisterSession(localDb, session);
+  // Phase 22.1: this device has now been PROVEN, online, to be
+  // authorized for this register (the server's resolve_authorized_register
+  // already checked tenant/store/register ownership before this session
+  // could open). Remembering it is what lets an offline shift-start later
+  // reopen the SAME register without re-trusting an unverified id.
+  saveKnownRegister(localDb, session.register_id);
 });
 
 ipcMain.handle("cash:get-cached-session", () => {
   return getLocalRegisterSession(localDb) ?? null;
+});
+
+// --- Phase 22.1: offline shift-start IPC surface ---
+
+ipcMain.handle("auth:cache-offline-credential", (_evt, args: { email: string; password: string }) => {
+  cacheOfflineCredential(localDb, args.email, args.password);
+});
+
+ipcMain.handle("auth:offline-login", (_evt, args: { email: string; password: string }) => {
+  try {
+    return { ok: true as const, context: verifyOfflineLogin(localDb, args.email, args.password) };
+  } catch (err) {
+    if (err instanceof OfflineAuthError) return { ok: false as const, error: err.message };
+    throw err;
+  }
+});
+
+ipcMain.handle("cash:open-shift-offline", (_evt, args: { registerId: number; openingCashMinor: number }) => {
+  try {
+    return { ok: true as const, result: openShiftOffline(localDb, args.registerId, args.openingCashMinor) };
+  } catch (err) {
+    if (err instanceof OfflineShiftError) return { ok: false as const, error: err.message };
+    throw err;
+  }
 });
 
 ipcMain.handle("checkout:offline", (_evt, cart: OfflineCartLine[]) => {

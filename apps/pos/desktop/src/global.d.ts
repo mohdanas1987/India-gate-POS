@@ -20,8 +20,8 @@ declare global {
       clearAuthToken: () => Promise<void>;
       saveAuthContext: (ctx: { user_id: number; tenant_id: number; store_id: number | null; role: string }) => Promise<void>;
       getCachedAuthContext: () => Promise<{ user_id: number; tenant_id: number; store_id: number | null; role: string } | null>;
-      syncCatalog: () => Promise<{ count: number }>;
-      searchLocalProducts: (query: string) => Promise<
+      syncCatalog: () => Promise<{ count: number; categoryCount: number }>;
+      searchLocalProducts: (query: string | null, categoryId?: number | null) => Promise<
         Array<{
           id: number;
           name: string;
@@ -30,10 +30,12 @@ declare global {
           currency: string;
           unit: string;
           is_weighted: number;
+          category_id: number | null;
           tax_rate_basis_points: number | null;
           barcodes: string;
         }>
       >;
+      listLocalCategories: () => Promise<Array<{ id: number; name: string; slug: string; product_count: number }>>;
       cacheOpenSession: (session: {
         session_id: number;
         register_id: number;
@@ -81,6 +83,23 @@ declare global {
         status: number;
         body: unknown;
       }>;
+
+      // Phase 22.1 — offline shift-start.
+      cacheOfflineCredential: (email: string, password: string) => Promise<void>;
+      offlineLogin: (
+        email: string,
+        password: string
+      ) => Promise<
+        | { ok: true; context: { user_id: number; tenant_id: number; store_id: number | null; role: string } }
+        | { ok: false; error: string }
+      >;
+      openShiftOffline: (
+        registerId: number,
+        openingCashMinor: number
+      ) => Promise<
+        | { ok: true; result: { registerId: number; openedAt: string; clientSessionId: string } }
+        | { ok: false; error: string }
+      >;
     };
   }
 }
