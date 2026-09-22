@@ -11,8 +11,21 @@ import { computeLineTotal, formatMoney, formatWeight } from "../lib/pricing";
  * "line selection" requirement; nothing yet acts on a selected line
  * beyond highlighting it, since per-line discount/void-before-checkout
  * are Phase 9B/9C scope, not 9A), and a Clear Cart action.
+ *
+ * Phase 9A correction gate (CTO review of d6bad7c, finding #4): every
+ * line is now identified by its own `lineId` (a UUID minted once when
+ * the line is added — see cartLineId.ts), not by `productId`. Two
+ * separate weigh-ins of the same weighted product (Gouda 250g, Gouda
+ * 500g) are two distinct lines with the same productId but different
+ * lineIds, so removing/selecting/adjusting one can never affect the
+ * other — a real bug in the original Phase 9A cart, since a React `key`
+ * and every callback here were keyed on productId, which collided the
+ * moment two lines shared a product. `productId` remains on the line as
+ * the product REFERENCE (needed for checkout/pricing), it is just no
+ * longer used as the line's identity.
  */
 export interface CartLine {
+  lineId: string;
   productId: number;
   name: string;
   quantity: number;
@@ -24,14 +37,14 @@ export interface CartLine {
 
 interface CartPanelProps {
   lines: CartLine[];
-  selectedProductId: number | null;
-  onSelectLine: (productId: number | null) => void;
-  onChangeQuantity: (productId: number, quantity: number) => void;
-  onRemoveLine: (productId: number) => void;
+  selectedLineId: string | null;
+  onSelectLine: (lineId: string | null) => void;
+  onChangeQuantity: (lineId: string, quantity: number) => void;
+  onRemoveLine: (lineId: string) => void;
   onClearCart: () => void;
 }
 
-export function CartPanel({ lines, selectedProductId, onSelectLine, onChangeQuantity, onRemoveLine, onClearCart }: CartPanelProps) {
+export function CartPanel({ lines, selectedLineId, onSelectLine, onChangeQuantity, onRemoveLine, onClearCart }: CartPanelProps) {
   if (lines.length === 0) {
     return <p className="text-sm text-gray-400 py-4 text-center">Cart is empty — search or scan a product to begin.</p>;
   }
@@ -54,14 +67,18 @@ export function CartPanel({ lines, selectedProductId, onSelectLine, onChangeQuan
             { price_minor: l.unitPriceMinor, currency: l.currency, is_weighted: l.isWeighted, tax_rate_basis_points: l.taxRateBasisPoints },
             l.quantity
           );
-          const isSelected = selectedProductId === l.productId;
+          const isSelected = selectedLineId === l.lineId;
           return (
             <tr
-              key={l.productId}
-              onClick={() => onSelectLine(isSelected ? null : l.productId)}
+              key={l.lineId}
+              data-testid={`cart-line-${l.lineId}`}
+              onClick={() => onSelectLine(isSelected ? null : l.lineId)}
               className={`cursor-pointer border-b last:border-b-0 ${isSelected ? "bg-yellow-50" : "hover:bg-gray-50"}`}
             >
-              <td className="py-1">{l.name}</td>
+              <td className="py-1">
+                {l.name}
+                {l.isWeighted && <span className="text-gray-400"> ({formatWeight(l.quantity)})</span>}
+              </td>
               <td className="py-1">
                 {l.isWeighted ? (
                   <span>{formatWeight(l.quantity)}</span>
@@ -70,8 +87,9 @@ export function CartPanel({ lines, selectedProductId, onSelectLine, onChangeQuan
                     <button
                       type="button"
                       aria-label={`Decrease quantity of ${l.name}`}
+                      data-testid={`decrease-qty-${l.lineId}`}
                       className="w-5 h-5 border rounded text-xs leading-none"
-                      onClick={() => onChangeQuantity(l.productId, l.quantity - 1)}
+                      onClick={() => onChangeQuantity(l.lineId, l.quantity - 1)}
                     >
                       −
                     </button>
@@ -82,14 +100,15 @@ export function CartPanel({ lines, selectedProductId, onSelectLine, onChangeQuan
                       value={l.quantity}
                       onChange={(e) => {
                         const parsed = parseInt(e.target.value, 10);
-                        if (Number.isFinite(parsed)) onChangeQuantity(l.productId, parsed);
+                        if (Number.isFinite(parsed)) onChangeQuantity(l.lineId, parsed);
                       }}
                     />
                     <button
                       type="button"
                       aria-label={`Increase quantity of ${l.name}`}
+                      data-testid={`increase-qty-${l.lineId}`}
                       className="w-5 h-5 border rounded text-xs leading-none"
-                      onClick={() => onChangeQuantity(l.productId, l.quantity + 1)}
+                      onClick={() => onChangeQuantity(l.lineId, l.quantity + 1)}
                     >
                       +
                     </button>
@@ -103,10 +122,11 @@ export function CartPanel({ lines, selectedProductId, onSelectLine, onChangeQuan
                 <button
                   type="button"
                   aria-label={`Remove ${l.name} from cart`}
+                  data-testid={`remove-line-${l.lineId}`}
                   className="text-red-600 text-xs px-1"
                   onClick={(e) => {
                     e.stopPropagation();
-                    onRemoveLine(l.productId);
+                    onRemoveLine(l.lineId);
                   }}
                 >
                   Remove

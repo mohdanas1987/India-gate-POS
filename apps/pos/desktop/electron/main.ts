@@ -219,11 +219,19 @@ ipcMain.handle("catalog:sync", async () => {
   const categoryRows: LocalCategoryRow[] = categories.map((c) => ({ id: c.id, name: c.name, slug: c.slug }));
   replaceLocalCategories(localDb, categoryRows);
 
-  const res = await fetch(`${API_BASE}/api/v1/products?limit=1000`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) throw new Error(`Catalog sync failed: HTTP ${res.status}`);
-  const products = (await res.json()) as Array<{
+  // Phase 9A correction gate (CTO review of d6bad7c, finding #8): a
+  // single `?limit=1000` request could never retrieve India Gate's real
+  // catalog (~6,843 products) — anything past the first 1000 (by
+  // whatever arbitrary order Postgres happened to return) was silently
+  // never synced to the device, so a cashier's offline search for a
+  // real product could come back empty depending on its id. This now
+  // pages through the FULL pos_visible catalog via the products
+  // endpoint's new `cursor` keyset pagination (ordered by id, so pages
+  // never overlap or skip a row), accumulating every page in memory
+  // before calling replaceLocalCatalog() exactly once — the local
+  // snapshot swap stays atomic (one transaction, per schema.ts), it's
+  // just fed by N HTTP pages instead of one.
+  type CatalogProduct = {
     id: number;
     name: string;
     sku: string | null;
@@ -234,8 +242,24 @@ ipcMain.handle("catalog:sync", async () => {
     category_id: number | null;
     tax_rate_basis_points: number | null;
     barcodes: string[];
-  }>;
-  const rows: LocalProductRow[] = products.map((p) => ({
+  };
+  const PAGE_SIZE = 500;
+  const allProducts: CatalogProduct[] = [];
+  let cursor: number | null = null;
+  for (;;) {
+    const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
+    if (cursor !== null) params.set("cursor", String(cursor));
+    const pageRes = await fetch(`${API_BASE}/api/v1/products?${params.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!pageRes.ok) throw new Error(`Catalog sync failed: HTTP ${pageRes.status}`);
+    const page = (await pageRes.json()) as CatalogProduct[];
+    if (page.length === 0) break;
+    allProducts.push(...page);
+    cursor = page[page.length - 1].id;
+    if (page.length < PAGE_SIZE) break; // short page = last page
+  }
+  const rows: LocalProductRow[] = allProducts.map((p) => ({
     id: p.id,
     name: p.name,
     sku: p.sku,

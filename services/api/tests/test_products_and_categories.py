@@ -93,3 +93,52 @@ def test_search_does_not_duplicate_a_product_with_multiple_barcodes(db, catalog_
 def test_product_out_carries_category_id(db, catalog_setup):
     results = search_products(q="Rice", category_id=None, limit=50, db=db, principal=catalog_setup["principal"])
     assert results[0].category_id == catalog_setup["grocery"].id
+
+
+def test_cursor_pagination_pages_through_the_full_catalog_with_no_gaps_or_duplicates(db, catalog_setup):
+    """
+    Phase 9A correction gate (CTO review of d6bad7c, finding #8): the
+    Electron offline catalog sync used to do one `?limit=1000` request and
+    simply could not retrieve a catalog bigger than that — India Gate's
+    real dataset has ~6,843 products. This proves the fix at the layer
+    the bug actually lived in: the search endpoint's own pagination
+    contract, independent of Electron. Seeds enough extra products that a
+    small page size forces multiple pages, then walks the `cursor` the
+    same way the Electron sync loop does (last id of the previous page,
+    stop on a short page) and asserts every product is returned exactly
+    once, in ascending id order, matching the actual seeded set.
+    """
+    tenant_id = catalog_setup["principal"].tenant_id
+    tax = db.query(Tax).filter(Tax.tenant_id == tenant_id).first()
+    grocery = catalog_setup["grocery"]
+    extra_products = [
+        Product(
+            tenant_id=tenant_id, category_id=grocery.id, tax_id=tax.id, sku=f"PG-{i}",
+            name=f"Pagination Test Product {i}", price_minor=100 + i, currency="EUR", unit="piece",
+        )
+        for i in range(7)
+    ]
+    db.add_all(extra_products)
+    db.commit()
+
+    all_seeded_ids = sorted([catalog_setup["rice"].id, catalog_setup["cola"].id] + [p.id for p in extra_products])
+
+    collected: list[int] = []
+    cursor = None
+    page_size = 3
+    pages_fetched = 0
+    while True:
+        pages_fetched += 1
+        assert pages_fetched <= 20, "pagination loop did not terminate — cursor is not advancing"
+        page = search_products(
+            q=None, category_id=None, limit=page_size, cursor=cursor, db=db, principal=catalog_setup["principal"]
+        )
+        if not page:
+            break
+        collected.extend(p.id for p in page)
+        cursor = page[-1].id
+        if len(page) < page_size:
+            break
+
+    assert pages_fetched > 1, "test fixture didn't actually force multiple pages"
+    assert collected == all_seeded_ids, "cursor pagination must return every product exactly once, in id order"

@@ -4,7 +4,7 @@ from app.domain.authz import User
 from app.domain.cash import CashierSession
 from app.domain.catalog import Product, Tax, Category
 from app.domain.inventory import InventoryLedger
-from app.domain.orders import PaymentMethod
+from app.domain.orders import OrderLine, PaymentMethod
 from app.domain.seed import seed_all
 from app.domain.tenancy import Register, Store
 from app.services.checkout import CartLineInput, NoOpenSessionError, InvalidCartError, create_pos_sale, compute_line_total
@@ -111,6 +111,70 @@ def test_weighted_product_checkout_end_to_end_charges_correctly(db, store_setup)
     # for a weighted product), consistent with quantity_delta's existing
     # signed-integer convention — not silently converted to kilos.
     assert ledger_row.quantity_delta == -500
+
+
+def test_checkout_accepts_two_separate_weighted_lines_of_the_same_product(db, store_setup):
+    """
+    Phase 9A correction gate (CTO review of d6bad7c, finding #4 — cart-line
+    identity). The bug the CTO found was in the frontend's cart state (two
+    weigh-ins of the same product collided because the cart keyed lines by
+    productId instead of a per-line id — fixed in PosPage.tsx/CartPanel.tsx
+    via a new lineId). This test proves the OTHER half of that finding
+    holds too: create_pos_sale() itself must never assume `lines` is keyed
+    by product id and never merge/collapse two entries that share a
+    product id — it must write one independent OrderLine + one independent
+    InventoryLedger row per line in the list, in order, regardless of
+    whether two lines reference the same product. A cashier ringing up
+    Gouda 250g then Gouda 500g as two separate weigh-ins must get two
+    separate order lines (350 total: 250g + 500g), not one merged 750g
+    line and not one line silently overwriting the other.
+    """
+    tax = store_setup["tax"]
+    weighted_product = Product(
+        tenant_id=store_setup["tenant_id"], category_id=store_setup["product"].category_id, tax_id=tax.id,
+        sku="GOUDA-KG", name="Gouda Cheese", price_minor=1200, currency="EUR", unit="kg", is_weighted=True,
+    )
+    db.add(weighted_product)
+    db.flush()
+    db.add(CashierSession(
+        tenant_id=store_setup["tenant_id"], store_id=store_setup["store_id"], register_id=store_setup["register_id"],
+        cashier_user_id=store_setup["user_id"], opening_cash_minor=10000, is_open=True,
+    ))
+    db.commit()
+
+    order = create_pos_sale(
+        db, tenant_id=store_setup["tenant_id"], store_id=store_setup["store_id"], register_id=store_setup["register_id"],
+        cashier_user_id=store_setup["user_id"],
+        lines=[
+            CartLineInput(weighted_product.id, 250),  # first weigh-in: 250g
+            CartLineInput(weighted_product.id, 500),  # second weigh-in: 500g
+        ],
+        payment_method=PaymentMethod.CASH,
+    )
+
+    # 250g -> 3.00 EUR (300 minor units), 500g -> 6.00 EUR (600 minor
+    # units): 900 minor units subtotal if — and only if — both lines were
+    # priced and summed independently rather than merged into one 750g line
+    # (which would coincidentally total the same subtotal but leave only
+    # ONE order line and ONE ledger row instead of two).
+    assert order.subtotal_minor == 900
+    assert order.tax_minor == round(900 * 0.21)
+
+    order_lines = (
+        db.query(OrderLine).filter(OrderLine.order_id == order.id).order_by(OrderLine.id).all()
+    )
+    assert len(order_lines) == 2, "two separate weigh-ins of the same product must produce two OrderLine rows, not one merged row"
+    assert [l.quantity for l in order_lines] == [250, 500]
+    assert order_lines[0].line_total_minor != order_lines[1].line_total_minor
+
+    ledger_rows = (
+        db.query(InventoryLedger)
+        .filter(InventoryLedger.reference_id == str(order.id))
+        .order_by(InventoryLedger.id)
+        .all()
+    )
+    assert len(ledger_rows) == 2, "two separate weigh-ins must decrement inventory as two independent ledger rows"
+    assert sorted(r.quantity_delta for r in ledger_rows) == [-500, -250]
 
 
 def test_checkout_fails_without_open_session(db, store_setup):

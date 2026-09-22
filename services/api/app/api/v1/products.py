@@ -64,9 +64,25 @@ def search_products(
     q: str | None = None,
     category_id: int | None = None,
     limit: int = 50,
+    cursor: int | None = None,
     db: Session = Depends(get_db),
     principal: Principal = Depends(require_permission("orders.create")),
 ):
+    """
+    `cursor` (Phase 9A correction gate — CTO review of d6bad7c, finding
+    #8): the previous offline catalog-sync pull did `?limit=1000` in one
+    shot and simply could not retrieve a catalog bigger than that (India
+    Gate's real dataset has ~6,843 products). Rather than raise the cap
+    arbitrarily (still a scaling wall) or build a second parallel sync
+    mechanism, this adds standard id-keyset pagination to the existing
+    search endpoint: pass the highest `id` seen in the previous page as
+    `cursor` to get the next page, ordered by `Product.id` ascending so
+    pages never overlap or skip a row even if products are inserted
+    between calls (unlike OFFSET pagination, which can). An empty result
+    (or a page shorter than `limit`) means the caller has reached the
+    end. `q`/`category_id` searches are unaffected and typically don't
+    need to paginate at all — this exists for the full-catalog pull.
+    """
     # Tenant-scoped: previously this had no tenant filter at all, so a
     # search would return every tenant's products mixed together.
     query = (
@@ -75,6 +91,8 @@ def search_products(
         .where(Product.is_deleted.is_(False))
         .where(Product.pos_visible.is_(True))
     )
+    if cursor is not None:
+        query = query.where(Product.id > cursor)
     if q:
         like = f"%{q}%"
         # Phase 9A: the gap analysis found this only ever matched
@@ -100,9 +118,10 @@ def search_products(
         # resolve-and-403 step for a read-only filter.
         query = query.where(Product.category_id == category_id)
     # `limit` is also used by the Electron app's offline catalog-sync pull
-    # (Phase 8 rebuild) to fetch the full pos_visible catalog in one call
-    # rather than being capped at 50 forever.
-    products = db.execute(query.limit(min(limit, 1000))).scalars().all()
+    # (Phase 8 rebuild, now paginated via `cursor` above) to page through
+    # the full pos_visible catalog rather than being capped at one fixed
+    # page forever. Ordered by id so keyset pagination is stable.
+    products = db.execute(query.order_by(Product.id).limit(min(limit, 1000))).scalars().all()
     taxes = {t.id: t for t in db.execute(select(Tax).where(Tax.tenant_id == principal.tenant_id)).scalars().all()}
     return [ProductOut.from_product(p, taxes) for p in products]
 

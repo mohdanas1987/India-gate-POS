@@ -31,6 +31,7 @@ import { CategorySidebar, CategoryDto } from "../components/CategorySidebar";
 import { CartPanel, CartLine } from "../components/CartPanel";
 import { WeightEntryDialog } from "../components/WeightEntryDialog";
 import { computeLineTotal, formatMoney } from "../lib/pricing";
+import { generateCartLineId } from "../lib/cartLineId";
 import { authedFetch, isElectron } from "../api/authedFetch";
 
 const DEFAULT_REGISTER_ID = 1; // single-register default until store/register selection UI exists (Phase 13/9)
@@ -148,7 +149,7 @@ export function PosPage() {
   const [search, setSearch] = useState("");
   const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
   const [cart, setCart] = useState<CartLine[]>([]);
-  const [selectedLineId, setSelectedLineId] = useState<number | null>(null);
+  const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
   const [lastReceipt, setLastReceipt] = useState<string | null>(null);
   const [sessionChecked, setSessionChecked] = useState(false);
   const [hasOpenSession, setHasOpenSession] = useState(false);
@@ -352,17 +353,24 @@ export function PosPage() {
 
   function addToCart(p: ProductDto, quantity = 1) {
     setCart((prev) => {
-      const existing = prev.find((l) => l.productId === p.id);
-      if (existing && !p.is_weighted) {
+      const existing = prev.find((l) => l.productId === p.id && !p.is_weighted);
+      if (existing) {
         // Weighted lines are never merged — each weigh-in is its own
         // line (a cashier re-weighing the same product is a second sale
         // of it, not automatically additive), matching how a real scale
-        // workflow behaves. Whole-unit products still merge quantities.
-        return prev.map((l) => (l.productId === p.id ? { ...l, quantity: l.quantity + quantity } : l));
+        // workflow behaves. Whole-unit products still merge quantities,
+        // keeping the SAME lineId (it's the same cart line getting
+        // bigger, not a new one).
+        return prev.map((l) => (l.lineId === existing.lineId ? { ...l, quantity: l.quantity + quantity } : l));
       }
       return [
         ...prev,
         {
+          // Phase 9A correction gate (CTO review of d6bad7c, finding
+          // #4): identity is the lineId, minted fresh here — never
+          // productId, which two lines can legitimately share (two
+          // separate weigh-ins of the same weighted product).
+          lineId: generateCartLineId(),
           productId: p.id,
           name: p.name,
           quantity,
@@ -383,16 +391,16 @@ export function PosPage() {
     }
   }
 
-  function changeCartQuantity(productId: number, quantity: number) {
+  function changeCartQuantity(lineId: string, quantity: number) {
     setCart((prev) => {
-      if (quantity <= 0) return prev.filter((l) => l.productId !== productId);
-      return prev.map((l) => (l.productId === productId ? { ...l, quantity } : l));
+      if (quantity <= 0) return prev.filter((l) => l.lineId !== lineId);
+      return prev.map((l) => (l.lineId === lineId ? { ...l, quantity } : l));
     });
   }
 
-  function removeCartLine(productId: number) {
-    setCart((prev) => prev.filter((l) => l.productId !== productId));
-    setSelectedLineId((prev) => (prev === productId ? null : prev));
+  function removeCartLine(lineId: string) {
+    setCart((prev) => prev.filter((l) => l.lineId !== lineId));
+    setSelectedLineId((prev) => (prev === lineId ? null : prev));
   }
 
   function clearCart() {
@@ -537,7 +545,7 @@ export function PosPage() {
           <div className="flex-1">
             <CartPanel
               lines={cart}
-              selectedProductId={selectedLineId}
+              selectedLineId={selectedLineId}
               onSelectLine={setSelectedLineId}
               onChangeQuantity={changeCartQuantity}
               onRemoveLine={removeCartLine}
